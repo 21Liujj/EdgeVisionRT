@@ -2,6 +2,8 @@
 
 > 单 Jetson Orin Nano Super 8GB + 单 USB 摄像头，完成 **4ms 常驻检测 → 开放词汇补检 → VLM 语义确认** 的三级级联。
 > 融合三个边缘 AI 项目为单一仓库，COCO val2017 全量实测，Docker 单容器交付。
+>
+> [English](./README_EN.md) | **中文**
 
 ## 一句话
 

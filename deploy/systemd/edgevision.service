@@ -1,0 +1,35 @@
+[Unit]
+Description=EdgeVisionRT inference daemon (Orin Nano)
+Documentation=file:///home/nvidia/edgevisionrt/docs/m6_tech_analysis.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=nvidia
+Group=nvidia
+# Board deploy path. WorkingDirectory matters: daemon resolves the engine
+# and sessions paths relative to it when flags are relative.
+WorkingDirectory=/home/nvidia/edgevisionrt
+ExecStart=/home/nvidia/edgevisionrt/build/board/edgevisiond \
+  --engine models/yolov8n_fp16.engine \
+  --device /dev/video-edgevision \
+  --sock /tmp/edgevisiond.sock \
+  --sessions /home/nvidia/edgevisionrt/sessions \
+  --http 8080
+# Camera may appear after boot (USB probe) or re-enumerate on hotplug.
+# Restart with backoff instead of failing the boot.
+Restart=on-failure
+RestartSec=5
+# Journal carries heartbeat + session summaries; cap disk use.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=edgevisiond
+# Hardening: daemon only needs the camera, its models/sessions, and the socket.
+NoNewPrivileges=true
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

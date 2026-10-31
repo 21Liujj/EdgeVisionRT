@@ -1,0 +1,29 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "board-native",
+      "displayName": "Jetson board native build",
+      "description": "Primary path: configure and build directly on Orin Nano (aarch64 + JetPack).",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/board",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "EDGEVISION_ENABLE_V4L2": "ON",
+        "EDGEVISION_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "host-offline",
+      "displayName": "Host offline build (no camera)",
+      "description": "Windows/WSL/x86: offline-capable targets only (core lib + unit tests). V4L2 auto-disabled off Linux.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/host",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "EDGEVISION_ENABLE_V4L2": "OFF",
+        "EDGEVISION_BUILD_TESTS": "ON"
+      }
+    }
+  ]
+}

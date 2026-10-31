@@ -1,0 +1,34 @@
+{
+  "_comment": "EdgeVisionRT unified config — single source of truth (M9 fusion). Env vars EDGEVISION_* override each section.",
+  "project_root": "/home/nvidia/edgevisionrt",
+  "daemon": {
+    "sock": "/tmp/edgevisiond.sock",
+    "http_port": 8080,
+    "sessions_dir": "sessions",
+    "review_dir": "pending_review",
+    "review_keep": 20
+  },
+  "vendors": {
+    "jetson_deploy_lab": "/home/nvidia/jetson-deploy-lab",
+    "edgeqwen": "/home/nvidia/edgeqwen",
+    "edgeqwen_build": "/home/nvidia/edgeqwen/TensorRT-Edge-LLM/build",
+    "use_vendored_scripts": true
+  },
+  "nanoowl": {
+    "run_script": "vendors/nanoowl/run_nanoowl.py",
+    "nanosam_bin": "vendors/nanoowl/nanosam_cpp",
+    "owl_engine": "models/owlvit_image_encoder_patch32.engine",
+    "sam_encoder": "models/resnet18_image_encoder.engine",
+    "sam_decoder": "models/mobile_sam_mask_decoder.engine",
+    "python_pkg": "third_party/nanoowl",
+    "torch2trt_egg": "third_party/torch2trt/dist/torch2trt-0.5.0-py3.10.egg",
+    "owl_model": "google/owlvit-base-patch32",
+    "threshold": 0.10
+  },
+  "qwen": {
+    "ask_bin": "vendors/edgeqwen/qwen_ask",
+    "plugin": "libNvInfer_edgellm_plugin.so",
+    "llm_dir": "models/qwen_llm",
+    "visual_dir": "models/qwen_visual"
+  }
+}

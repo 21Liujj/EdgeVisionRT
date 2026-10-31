@@ -1,0 +1,7 @@
+# EdgeVisionRT camera persistence (M6 service layer).
+#
+# The daemon opens --device /dev/video-edgevision so a USB re-enumeration
+# (unplug/replug, hub reset) never shifts the node number under it.
+# Match the board's Generic Web Camera; extend idVendor/idProduct when the
+# hardware changes, never by kernel index.
+ACTION=="add", SUBSYSTEM=="video4linux", ATTRS{idVendor}=="4a54", ATTRS{idProduct}=="5232", SYMLINK+="video-edgevision", MODE="0666"

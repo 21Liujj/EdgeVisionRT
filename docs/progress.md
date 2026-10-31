@@ -1,0 +1,42 @@
+# EdgeVisionRT — progress (single source of truth)
+
+> Rule: code and reports can lie stale; this file is the only place that says
+> "what stage are we at, what evidence exists, what is next".
+
+## Current: M8 fusion + COCO full eval (done, board-verified 2026-10-31)
+
+| Item | State | Evidence |
+|---|---|---|
+| Single-repo fusion (vendors/ + config + paths.py + eval/) | done (board-verified) | `docs/m8_fusion_report.md`; `RUN_OWL` resolves to `vendors/nanoowl/run_nanoowl.py` |
+| YOLO COCO val2017 full (5000 imgs) | done (board) | AP 0.216 / AP50 0.301, 4.34ms avg (`eval/out_yolo/`) |
+| NanoOWL COCO val2017 full (5000 imgs) | done (board) | AP 0.259 / AP50 0.408 (`eval/out_owl/coco_eval_summary.json`) |
+| Cup live 3-stage cascade (YOLO→OWL→Qwen) | done (board) | `pending_review/20261031_111708_f12/`; Qwen "Yes, there is a cup..." 15.6s |
+| M8d docs | done | `docs/m8_fusion_report.md` |
+
+## Previous: M7 scheduler placeholder (done, board-verified 2026-10-30)
+
+| Item | State | Evidence |
+|---|---|---|
+| Repo skeleton (CMake/presets/core/queue/camera/probe/tests) | done (host-side) | files under `edgevisionrt/` |
+| Host offline build (`host-offline` preset + ctest) | done (Windows MSYS2 ucrt64 g++15.2 + pip cmake4.4.4/ninja1.13.2, 2/2 pass) | `build/host`, `ctest --test-dir build/host` |
+| M0 env+camera freeze | done (board) | `reports/environment.json`, `reports/camera_caps.json` |
+| M1 V4L2 streaming (`capture_probe --stream`) | done (board) | MJPEG 720p session artifacts |
+| M2 TRT deploy (YOLOv8-n FP16) | done (board) | `models/yolov8n_fp16.engine`, `infer_bench` p50 ~4.4ms |
+| M3 self CUDA preprocess | done (board) | `src/backends/cuda_preprocess.cu`, M2 latency includes it |
+| M4 BSP/power (15W vs MAXN_SUPER + jetson_clocks) | done (board) | `docs/m4_tech_analysis.md`; MAXN locked 4.36ms avg |
+| M5 uvcvideo diagnostics (ftrace vb2) | done (board) | `docs/m5_tech_analysis.md`; MJPEG 720p 30fps clean |
+| M6 service (systemd + udev + atomic sessions + web UI) | done (board) | `docs/m6_tech_analysis.md`; `edgevision.service` active |
+| M7 scheduler placeholder + rule UI | done (board-verified) | `docs/m7_tech_analysis.md`; `RULE`/`api/rule`/yellow bar/agent smoke all pass; stream smoke 416 frames avg 4.36ms |
+| M7 rule unit test (host, no hw) | done | `tests/test_m7_rule.py` 6/6 pass |
+| 8h long-run stability | DEFERRED | per plan, not started |
+| docker image | DEFERRED | per plan, not started |
+| NanoOWL/VLM real workers | NEXT | M7 placeholder hooks ready (`pending_review/` convention) |
+
+## Milestone map
+
+- M0 env+camera freeze → M1 V4L2 data plane → M2 TRT deploy (YOLOv8-n FP16) →
+  M3 self CUDA preprocess → M4 BSP/power → M5 uvcvideo diagnostics →
+  M6 service + 8h stability → M7 selective fusion (NanoOWL/NanoSAM/VLM workers)
+
+M0–M6 done on board; M7 placeholder done (rule plumbing + visualization).
+Next: real 2nd-stage worker (NanoOWL VRAM check first) or 8h run.

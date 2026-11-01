@@ -11,6 +11,10 @@ HOST_ROOT="${EDGEVISION_HOST_ROOT:-/home/nvidia/edgevisionrt}"
 EDGEQWEN_BUILD="${EDGEVISION_EDGEQWEN_BUILD:-/home/nvidia/edgeqwen/TensorRT-Edge-LLM/build}"
 JDL="${EDGEVISION_JDL:-/home/nvidia/jetson-deploy-lab}"
 GPU_FLAGS="--device nvidia.com/gpu=all"
+# M10 RTSP live monitor: annotated frames -> H.264 -> rtsp://<board>:8554/live
+# Override: EDGEVISION_RTSP=0 disables, EDGEVISION_RTSP_ENCODER=nvv4l2h264 for Jetson HW.
+RTSP_PORT="${EDGEVISION_RTSP:-8554}"
+RTSP_ENCODER="${EDGEVISION_RTSP_ENCODER:-x264}"
 
 if [ "${1:-}" = "--shell" ]; then
   exec docker run --rm -it \
@@ -44,5 +48,8 @@ exec docker run --rm \
   -v "$JDL/cpp_runtime/build/nanosam_cpp:/opt/edgeqwen-mnt/nanosam_cpp:ro" \
   -e EDGEVISION_QWEN_ASK=/opt/edgeqwen-mnt/qwen_ask \
   -e EDGEVISION_NANOSAM=/opt/edgeqwen-mnt/nanosam_cpp \
+  -e EDGEVISION_RTSP="$RTSP_PORT" \
+  -e EDGEVISION_RTSP_ENCODER="$RTSP_ENCODER" \
   -p 8080:8080 \
+  -p "$RTSP_PORT:$RTSP_PORT" \
   "$IMAGE"

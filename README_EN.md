@@ -67,6 +67,31 @@ bash eval/run_yolo_coco.sh   # YOLO full set
 bash eval/run_owl_coco.sh    # NanoOWL full set (needs pycocotools)
 ```
 
+## Live Monitor (M10: H.264 + RTSP)
+
+> `/snapshot.jpg` polling still works. New: **H.264 / RTSP live stream** — the same
+> annotated 480px boxed frames go straight to `rtsp://<board-ip>:8554/live`.
+> The inference thread never blocks (`appsrc max-buffers=2 drop=true`).
+
+- Pipeline: `appsrc(BGR) → videoconvert → x264enc(ultrafast/zerolatency, 800kbps) → rtph264pay`, embedded `gst-rtsp-server`, no external mediamtx needed
+- Jetson HW encode: one-flag switch `--rtsp-encoder nvv4l2h264` (`nvvideoconvert + nvv4l2h264enc`, auto-falls-back to x264 when absent)
+- Implementation: `include/edgevision/rtsp_server.h` + `src/stream/rtsp_server.cc` (`edgevision_stream` static lib, `EDGEVISION_ENABLE_RTSP` switch)
+- Hook: lazy-started in `update_snapshot` in `apps/edgevisiond/main.cc` on the first real frame size + `rtsp.push`
+- Flags: `--rtsp <port>` (default 8554, `0` disables), `--rtsp-encoder x264|nvv4l2h264`; in Docker override via `EDGEVISION_RTSP` / `EDGEVISION_RTSP_ENCODER`
+- Docker already ships the runtime libs (`gstreamer1.0-plugins-*` + `libgstrtspserver-1.0-0`); `run_board.sh` maps `-p 8554:8554`
+
+```bash
+# Native on-board: RTSP is on by default
+./build/board/edgevisiond --engine models/yolov8n_fp16.engine \
+  --device /dev/video-edgevision --sock /tmp/edgevisiond.sock \
+  --sessions ./sessions --http 8080 --rtsp 8554
+# Disable: --rtsp 0; HW encode: --rtsp-encoder nvv4l2h264
+
+# Watch (either works)
+ffplay -rtsp_transport tcp rtsp://<board-ip>:8554/live
+gst-launch-1.0 rtspsrc location=rtsp://<board-ip>:8554/live latency=0 ! rtph264depay ! avdec_h264 ! autovideosink
+```
+
 ## Docs
 
 - Progress (single source of truth): `docs/progress.md`

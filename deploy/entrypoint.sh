@@ -9,6 +9,8 @@ SOCK="${EDGEVISION_SOCK:-/tmp/edgevisiond.sock}"
 ENGINE="${EDGEVISION_ENGINE:-/opt/edgevisionrt/models/yolov8n_fp16.engine}"
 DEVICE="${EDGEVISION_DEVICE:-/dev/video-edgevision}"
 HTTP_PORT="${EDGEVISION_HTTP:-8080}"
+RTSP_PORT="${EDGEVISION_RTSP:-8554}"
+RTSP_ENCODER="${EDGEVISION_RTSP_ENCODER:-x264}"
 
 cleanup() {
   echo "[entrypoint] stopping..."
@@ -21,13 +23,15 @@ cleanup() {
 }
 trap cleanup TERM INT
 
-echo "[entrypoint] starting edgevisiond: engine=$ENGINE device=$DEVICE"
+echo "[entrypoint] starting edgevisiond: engine=$ENGINE device=$DEVICE rtsp=:$RTSP_PORT/live($RTSP_ENCODER)"
 "$ROOT/build/board/edgevisiond" \
   --engine "$ENGINE" \
   --device "$DEVICE" \
   --sock "$SOCK" \
   --sessions /opt/edgevisionrt/sessions \
-  --http "$HTTP_PORT" &
+  --http "$HTTP_PORT" \
+  --rtsp "$RTSP_PORT" \
+  --rtsp-encoder "$RTSP_ENCODER" &
 DAEMON_PID=$!
 
 # Wait for daemon socket before agent attaches (max 30s).

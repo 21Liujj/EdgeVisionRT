@@ -28,6 +28,25 @@ if(EDGEVISION_ENABLE_V4L2)
   target_link_libraries(edgevision_camera PUBLIC edgevision_core jpeg pthread)
 endif()
 
+# ---- RTSP live monitor (GStreamer appsrc -> H.264 -> rtsp) ----
+option(EDGEVISION_ENABLE_RTSP "Build RTSP live monitor (GStreamer)" ON)
+if(EDGEVISION_ENABLE_RTSP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(PkgConfig QUIET)
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-rtsp-server-1.0
+                      gstreamer-app-1.0)
+  endif()
+  if(GST_FOUND)
+    add_library(edgevision_stream STATIC src/stream/rtsp_server.cc)
+    target_include_directories(edgevision_stream PUBLIC include ${GST_INCLUDE_DIRS})
+    target_compile_definitions(edgevision_stream PRIVATE EDGEVISION_ENABLE_RTSP_IMPL)
+    target_link_libraries(edgevision_stream PUBLIC ${GST_LIBRARIES})
+    message(STATUS "RTSP monitor: ON (${GST_LIBRARIES})")
+  else()
+    message(STATUS "RTSP monitor: OFF (GStreamer not found)")
+  endif()
+endif()
+
 # ---- TensorRT backend ----
 if(EDGEVISION_ENABLE_TRT)
   enable_language(CUDA)
@@ -62,7 +81,8 @@ if(EDGEVISION_ENABLE_V4L2 AND EDGEVISION_ENABLE_TRT)
   target_link_libraries(infer_bench PRIVATE edgevision_core edgevision_camera edgevision_trt edgevision_cuda)
 
   add_executable(edgevisiond apps/edgevisiond/main.cc)
-  target_link_libraries(edgevisiond PRIVATE edgevision_core edgevision_camera edgevision_trt edgevision_cuda)
+  target_link_libraries(edgevisiond PRIVATE edgevision_core edgevision_camera edgevision_trt edgevision_cuda
+    $<$<TARGET_EXISTS:edgevision_stream>:edgevision_stream>)
 
   # file_infer: replay images through the SAME preprocess+infer+NMS (no V4L2).
   # Output goes to replay_*/ (explicitly NOT sessions/): replay never counts

@@ -15,12 +15,22 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
 
-# --- system deps: Python runtime + V4L2 utils only (no build toolchain) ---
+# --- system deps: Python runtime + V4L2 + GStreamer RTSP runtime only ---
+# NOTE: edgevisiond links gst-rtsp-server + x264 at build time (host);
+# container only needs the runtime libs to play rtsp://:8554/live.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3 \
       python3-pip \
-      v4l-utils && \
+      v4l-utils \
+      gstreamer1.0-tools \
+      gstreamer1.0-plugins-base \
+      gstreamer1.0-plugins-good \
+      gstreamer1.0-plugins-ugly \
+      gstreamer1.0-plugins-bad \
+      libgstreamer1.0-0 \
+      libgstrtspserver-1.0-0 \
+      libgstreamer-plugins-base1.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
 # --- Python deps (pure wheels only; torch/TRT stay from base image) ---
@@ -59,5 +69,8 @@ ENV EDGEVISION_ROOT=/opt/edgevisionrt
 # Runtime defaults: engines + sessions + socket are mounted, never baked.
 VOLUME ["/opt/edgevisionrt/models", "/opt/edgevisionrt/sessions", "/opt/edgevisionrt/pending_review"]
 
-EXPOSE 8080
+EXPOSE 8080 8554
+# RTSP live monitor: annotated 480px frames -> H.264 -> rtsp://<board>:8554/live
+# Daemon flags: --rtsp <port> (0=disable) --rtsp-encoder x264|nvv4l2h264
+# Env override: EDGEVISION_RTSP / EDGEVISION_RTSP_ENCODER (see entrypoint.sh)
 ENTRYPOINT ["/opt/edgevisionrt/deploy/entrypoint.sh"]

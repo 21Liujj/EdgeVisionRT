@@ -52,6 +52,7 @@ extern "C" {
 
 #include "edgevision/cuda_preprocess.h"
 #include "edgevision/mjpeg_decoder.h"
+#include "edgevision/rtsp_server.h"
 #include "edgevision/stream_session.h"
 #include "edgevision/trt_engine.h"
 
@@ -196,6 +197,11 @@ struct Daemon {
   int snap_w = 0, snap_h = 0;
   uint64_t snap_frame = 0;
   std::vector<Det> snap_dets;  // boxes in snap pixel coords
+
+  // ---- M10 RTSP live monitor: same annotated small frame -> H.264 ----
+  edgevision::RtspServer rtsp;
+  int rtsp_port = 8554;               // 0 = disable RTSP
+  std::string rtsp_encoder = "x264";  // x264 (SW) or nvv4l2h264 (Jetson HW)
 
   bool init_cuda() {
     if (!edgevision::cuda_preprocess::init()) {
@@ -701,6 +707,12 @@ struct Daemon {
     snap_h = dst_h;
     snap_frame++;
     snap_dets.swap(px);
+    // M10: push annotated frame to RTSP (drop-oldest, never blocks).
+    // Lazy-start on first real frame so width/height always match.
+    if (rtsp_port > 0 && !rtsp.running())
+      rtsp.start(rtsp_port, snap_w, snap_h, 30, rtsp_encoder);
+    // Copy under snap_mu; rtsp.push does its own drop when viewers are slow.
+    rtsp.push(snap_bgr, snap_w, snap_h);
   }
 
   // BGR -> JPEG (libjpeg-turbo, quality 70). Returns false on error.
@@ -1009,6 +1021,11 @@ struct Daemon {
     std::fflush(stdout);
     control_thread = std::thread(&Daemon::control_loop, this);
     http_thread = std::thread(&Daemon::http_loop, this);
+    // M10: RTSP live monitor (annotated 480px frames, drop-oldest).
+    // Lazy-started on first snapshot frame (real width/height); port 0 disables.
+    if (rtsp_port > 0)
+      std::printf("[edgevisiond] rtsp armed on :%d/live (encoder=%s)\n",
+                  rtsp_port, rtsp_encoder.c_str());
     while (!g_stop_process) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     // graceful: finish an open session before exiting
     bool need_stop = false;
@@ -1108,6 +1125,10 @@ int main(int argc, char** argv) {
       d.review_keep = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--http") == 0 && i + 1 < argc)
       d.http_port = std::atoi(argv[++i]);
+    else if (std::strcmp(argv[i], "--rtsp") == 0 && i + 1 < argc)
+      d.rtsp_port = std::atoi(argv[++i]);
+    else if (std::strcmp(argv[i], "--rtsp-encoder") == 0 && i + 1 < argc)
+      d.rtsp_encoder = argv[++i];
   }
   std::printf("[edgevisiond] device=%s sessions=%s\n", d.device.c_str(),
               d.sessions_dir.c_str());

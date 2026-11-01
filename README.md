@@ -67,6 +67,30 @@ bash eval/run_yolo_coco.sh   # YOLO 全量
 bash eval/run_owl_coco.sh    # NanoOWL 全量（需 pycocotools）
 ```
 
+## 实时监测（M10：H.264 + RTSP）
+
+> `/snapshot.jpg` 轮询还在，新增 **H.264 / RTSP 实时流**：带框的 480px 注解帧直推
+> `rtsp://<板子IP>:8554/live`，推理线程永不阻塞（`appsrc max-buffers=2 drop=true`）。
+
+- 管线：`appsrc(BGR) → videoconvert → x264enc(ultrafast/zerolatency, 800kbps) → rtph264pay`，内嵌 `gst-rtsp-server`，无需外部 mediamtx
+- Jetson 硬编码：一行切换 `--rtsp-encoder nvv4l2h264`（`nvvideoconvert + nvv4l2h264enc`，找不到自动回落 x264）
+- 实现：`include/edgevision/rtsp_server.h` + `src/stream/rtsp_server.cc`（`edgevision_stream` 静态库，`EDGEVISION_ENABLE_RTSP` 开关）
+- 接入点：`apps/edgevisiond/main.cc` 的 `update_snapshot` 里懒启动（首帧真实宽高）+ `rtsp.push`
+- 参数：`--rtsp <port>`（默认 8554，`0` 关闭）`--rtsp-encoder x264|nvv4l2h264`；容器用 `EDGEVISION_RTSP` / `EDGEVISION_RTSP_ENCODER` 覆盖
+- Docker 已含运行时库（`gstreamer1.0-plugins-*` + `libgstrtspserver-1.0-0`），`run_board.sh` 映射 `-p 8554:8554`
+
+```bash
+# 板上原生：RTSP 默认已开
+./build/board/edgevisiond --engine models/yolov8n_fp16.engine \
+  --device /dev/video-edgevision --sock /tmp/edgevisiond.sock \
+  --sessions ./sessions --http 8080 --rtsp 8554
+# 关掉：--rtsp 0；换硬编码：--rtsp-encoder nvv4l2h264
+
+# 观看（任选一）
+ffplay -rtsp_transport tcp rtsp://<板子IP>:8554/live
+gst-launch-1.0 rtspsrc location=rtsp://<板子IP>:8554/live latency=0 ! rtph264depay ! avdec_h264 ! autovideosink
+```
+
 ## 文档
 
 - 进度唯一真相源：`docs/progress.md`

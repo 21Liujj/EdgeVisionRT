@@ -929,10 +929,12 @@ struct Daemon {
   }
 
   static void send_resp(int cfd, const char* ctype, const void* body, std::size_t n) {
-    char head[256];
+    char head[384];
     int hl = std::snprintf(head, sizeof(head),
                            "HTTP/1.0 200 OK\r\nContent-Type: %s\r\n"
                            "Content-Length: %zu\r\nCache-Control: no-cache\r\n"
+                           "Access-Control-Allow-Origin: *\r\n"
+                           "Access-Control-Allow-Methods: GET, OPTIONS\r\n"
                            "Connection: close\r\n\r\n",
                            ctype, n);
     send_all(cfd, head, hl);
@@ -944,6 +946,15 @@ struct Daemon {
     ::recv(cfd, req, sizeof(req) - 1, 0);
     std::string line(req);
     line = line.substr(0, line.find("\r\n"));
+    // CORS preflight for the file:// interview demo page (double-click HTML).
+    if (line.rfind("OPTIONS", 0) == 0) {
+      const char* pre =
+          "HTTP/1.0 200 OK\r\nAccess-Control-Allow-Origin: *\r\n"
+          "Access-Control-Allow-Methods: GET, OPTIONS\r\nContent-Length: 0\r\n"
+          "Connection: close\r\n\r\n";
+      send_all(cfd, pre, std::strlen(pre));
+      return;
+    }
     auto snapshot = [&]() -> std::vector<uint8_t> {
       std::vector<uint8_t> bgr;
       int w = 0, h = 0;

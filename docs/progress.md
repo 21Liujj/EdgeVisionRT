@@ -3,7 +3,19 @@
 > Rule: code and reports can lie stale; this file is the only place that says
 > "what stage are we at, what evidence exists, what is next".
 
-## Current: M11 daemon hardening — lock discipline + bounded telemetry (done, host-verified 2026-11-01)
+## Current: M12 logging hardening — retention + crash-safety + disk self-inspection (done, host-verified 2026-11-01)
+
+| Item | State | Evidence |
+|---|---|---|
+| `sessions/` retention (`sessions_keep=20`, pruned on START outside `mu`) | done (host invariant) | `tests/test_m11_daemon_invariants.py` 28/28 pass; `prune_oldest(sessions_dir, sessions_keep)` |
+| `events.jsonl` crash-safety (`fflush` every ~30 frames + on review) | done (host invariant) | `events_unflushed` counter; `fflush(events_fp)` outside `mu` |
+| `summary.json` durability (`fflush`+`fsync` file + `fsync` dir) | done (host invariant) | `fsync(sfd)` before rename, `fsync(dfd)` after renames, best-effort |
+| `DISK` self-inspection (`/api/disk`: writable/probe/fs/sessions/reviews) | done (host invariant) | `handle_cmd("DISK")` all-I/O-outside-`mu`; console `r_disk/r_sessn/r_revn` panel |
+| Python logging with timestamps (`agent`+`dispatch`+`owl`+`qwen`) | done (host py_compile) | `logging.basicConfig` single format `%(asctime)s [%(levelname)s]` |
+| Host regression (m7 rule + m8 contract + m11/m12 invariants) | done (Windows host) | `test_m7_rule.py` 6/6, `test_m8_contract.py` 23/23, `test_m11_daemon_invariants.py` 28/28 |
+| Board verification (build M12 + START/STOP + /api/disk + STOP durability) | TODO (board) | needs `cmake --preset board-native`, START/STOP smoke, `/api/disk` check |
+
+## Previous: M11 daemon hardening — lock discipline + bounded telemetry (done, host-verified 2026-11-01)
 
 | Item | State | Evidence |
 |---|---|---|

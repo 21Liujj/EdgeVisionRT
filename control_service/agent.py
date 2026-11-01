@@ -7,9 +7,19 @@ Usage (on board):
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 
 from scheduler import decide, poll_once, report_worker, scan_results, scan_reviews
+
+# M12 logging: timestamps + level on every line so journald/docker logs are
+# greppable without SSH. Single format across agent + workers.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("agent")
 
 
 def main() -> int:
@@ -27,9 +37,9 @@ def main() -> int:
         st = poll_once(args.sock)
         review_dir = args.review_dir or st.review_dir
         if st.active_model != last_model:
-            print(f"[agent] model={st.active_model} reason={st.reason} "
-                  f"streak={st.low_conf_streak} max_conf={st.last_max_conf:.2f} "
-                  f"reviews={st.reviews_written}", flush=True)
+            log.info("model=%s reason=%s streak=%d max_conf=%.2f reviews=%d",
+                     st.active_model, st.reason, st.low_conf_streak,
+                     st.last_max_conf, st.reviews_written)
             last_model = st.active_model
 
         # cross-check pure rule fn stays in sync with daemon hint
@@ -40,26 +50,25 @@ def main() -> int:
             pending = scan_reviews(review_dir)
             done = scan_results(review_dir)
         except Exception as exc:
-            print(f"[agent] scan error: {exc}", flush=True)
+            log.warning("scan error: %s", exc)
             pending, done = [], []
 
         for m in pending:
             stamp = m.get("_stamp", "?")
             if stamp not in seen_reviews:
                 seen_reviews.add(stamp)
-                print(f"[agent] NEW REVIEW {stamp} trigger={m.get('trigger')} "
-                      f"model={m.get('active_model')} "
-                      f"boxes={len(m.get('yolo_boxes', []))} "
-                      f"crop={m.get('crop')}", flush=True)
+                log.info("NEW REVIEW %s trigger=%s model=%s boxes=%d crop=%s",
+                         stamp, m.get("trigger"), m.get("active_model"),
+                         len(m.get("yolo_boxes", [])), m.get("crop"))
                 # M8b/M8c: real worker subprocess (one at a time, blocking).
                 try:
                     from worker_dispatch import dispatch_review
                     dispatch_review(args.sock, m, review_dir)
                 except Exception as exc:
-                    print(f"[agent] worker dispatch failed: {exc}", flush=True)
+                    log.error("worker dispatch failed: %s", exc)
 
         if done and args.once:
-            print(f"[agent] done results: {len(done)}", flush=True)
+            log.info("done results: %d", len(done))
         if args.once:
             break
         time.sleep(args.interval)

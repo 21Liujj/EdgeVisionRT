@@ -206,8 +206,7 @@ struct MemInfo {
 };
 static MemInfo read_mem() {
   MemInfo m;
-  std::ifstream f("/proc/meminfo");
-  std::string k;
+  std::ifstream f("/proc/meminfo");  std::string k;
   long v;
   std::string unit;
   long tot_kb = -1, av_kb = -1;
@@ -283,6 +282,10 @@ struct Daemon {
   // Workers (off-board) scan for dirs containing meta.json (final, not .tmp).
   std::string review_dir = "./pending_review";
   int review_keep = 20;  // prune oldest review dirs beyond this count
+  // ---- M12 log retention: cap on-disk session history (daemon-enforced).
+  // Sessions are the only unbounded disk writer (events.jsonl per session);
+  // prune oldest beyond this count on every START (outside mu).
+  int sessions_keep = 20;
 
   // runtime
   std::mutex mu;
@@ -322,6 +325,7 @@ struct Daemon {
   std::string worker_detail;           // guarded by mu: short summary (<=60 chars shown on web)
   uint64_t reviews_written = 0;  // guarded by mu
   FILE* events_fp = nullptr;      // pipeline thread only
+  uint64_t events_unflushed = 0;  // pipeline thread only: frames since fflush
 
   // ---- web snapshot slot (M7a): latest annotated small frame ----
   std::mutex snap_mu;
@@ -336,7 +340,7 @@ struct Daemon {
 
   // ---- console metrics (bounded, never unbounded) ----
   uint64_t boot_ns_monotonic = 0;  // process start (CLOCK_MONOTONIC)
-  std::string version = "edgevisiond m11-console";
+  std::string version = "edgevisiond m12-log";
   std::string board_model;   // lazy-filled from /proc/device-tree/model
   std::string l4t_version;   // lazy-filled from /etc/nv_tegra_release
   // per-stage timings (ms), guarded by mu, capped at 600 samples
@@ -490,6 +494,8 @@ struct Daemon {
   static void prune_oldest(const std::string& dir, int keep) {
     // best-effort: keep newest `keep` subdirs, remove the rest.
     // No shell: explicit readdir + sort + remove (no injection, no fork).
+    // keep <= 0 means "keep all" (used when retention is disabled).
+    if (keep <= 0) return;
     try {
       std::vector<std::string> names;
       for (const auto& e : std::filesystem::directory_iterator(dir)) {
@@ -623,6 +629,9 @@ struct Daemon {
         err = "mkdir session dir failed: " + new_dir + " (" + ec.message() + ")";
         return false;
       }
+      // M12 retention: cap on-disk session history (daemon-enforced).
+      // prune_oldest keeps newest `sessions_keep` dirs; runs outside mu.
+      prune_oldest(sessions_dir, sessions_keep);
     }
     std::string ev_tmp = new_dir + "/events.jsonl.tmp";
     FILE* fp = std::fopen(ev_tmp.c_str(), "w");
@@ -663,6 +672,7 @@ struct Daemon {
     {
       std::lock_guard<std::mutex> lk(mu);
       events_fp = fp;
+      events_unflushed = 0;
       frames_ok = 0;
       decode_fail = 0;
       infer_fail = 0;
@@ -765,16 +775,32 @@ struct Daemon {
                  (unsigned long long)st.frames_dropped_pool.load(),
                  (unsigned long long)st.frames_dropped_queue.load(), avg, p50, p99, mn,
                  mx, (unsigned long long)dets);
+    // M12 crash-safety: flush + fsync file before rename so a power loss
+    // cannot leave a truncated summary.json as final. Best-effort fsync.
+    std::fflush(fp);
+    {
+      int sfd = ::fileno(fp);
+      if (sfd >= 0) ::fsync(sfd);
+    }
     std::fclose(fp);
     if (std::rename(tmp.c_str(), fin.c_str()) != 0) {
-      err = "rename summary.json failed";
+      err = std::string("rename summary.json failed: ") + std::strerror(errno);
       return false;
     }
     std::string ev_tmp = dir + "/events.jsonl.tmp";
     std::string ev_fin = dir + "/events.jsonl";
     if (std::rename(ev_tmp.c_str(), ev_fin.c_str()) != 0) {
-      err = "rename events.jsonl failed";
+      err = std::string("rename events.jsonl failed: ") + std::strerror(errno);
       return false;
+    }
+    // M12 durability: fsync the directory so both renames survive power loss
+    // on ext4. Best-effort: failure here must not fail the STOP.
+    {
+      int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+      if (dfd >= 0) {
+        ::fsync(dfd);
+        ::close(dfd);
+      }
     }
     return true;
   }
@@ -915,6 +941,13 @@ struct Daemon {
                    (unsigned long long)frame_no, (unsigned long long)wall_ns, lat_ms,
                    lat_dec, lat_inf, lat_post, dets.size(), mx, low ? 1 : 0,
                    cur_rule.c_str());
+      // M12 crash-safety: periodic fflush (~1s) so a crash loses at most
+      // ~30 frames instead of the whole session. Pipeline thread only,
+      // no mu held, cost is one write() per 30 frames.
+      if (++events_unflushed >= 30) {
+        std::fflush(events_fp);
+        events_unflushed = 0;
+      }
     }
     if (want_dump) {
       // Heavy JPEG + mkdir + rename fully outside mu: STATUS/HTTP never block.
@@ -928,6 +961,8 @@ struct Daemon {
                                   "\"escalated\":true,\"review\":\"%s\"}\n",
                        (unsigned long long)frame_no, (unsigned long long)wall_ns_now(),
                        review_stamp.c_str());
+          std::fflush(events_fp);
+          events_unflushed = 0;
         }
       } else {
         // dump failed: keep streak/stats, just no review dir this time
@@ -1257,6 +1292,78 @@ struct Daemon {
       j += "]}";
       return j;
     }
+    if (line == "DISK") {
+      // M12 disk self-inspection: no SSH needed to see why START failed.
+      // All filesystem/statvfs calls run OUTSIDE mu (never hold mu across I/O).
+      std::string c_sessions, c_review;
+      int c_skeep = 0, c_rkeep = 0;
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        c_sessions = sessions_dir;
+        c_review = review_dir;
+        c_skeep = sessions_keep;
+        c_rkeep = review_keep;
+      }
+      auto count_dirs = [](const std::string& dir, uint64_t& n,
+                           std::string& oldest, std::string& newest) {
+        n = 0;
+        oldest.clear();
+        newest.clear();
+        try {
+          for (const auto& e : std::filesystem::directory_iterator(dir)) {
+            if (!e.is_directory()) continue;
+            std::string nm = e.path().filename().string();
+            if (oldest.empty() || nm < oldest) oldest = nm;
+            if (newest.empty() || nm > newest) newest = nm;
+            n++;
+          }
+        } catch (...) {
+        }
+      };
+      uint64_t n_sess = 0, n_rev = 0;
+      std::string old_sess, new_sess, old_rev, new_rev;
+      count_dirs(c_sessions, n_sess, old_sess, new_sess);
+      count_dirs(c_review, n_rev, old_rev, new_rev);
+      // writability probe: create+remove a temp dir (this is what START does).
+      std::string probe_err;
+      {
+        std::error_code ec;
+        std::string probe = c_sessions + "/.writetest_" + session_stamp();
+        std::filesystem::create_directories(probe, ec);
+        if (ec) {
+          probe_err = ec.message();
+        } else {
+          std::error_code ec2;
+          std::filesystem::remove_all(probe, ec2);
+          if (ec2) probe_err = ec2.message();
+        }
+      }
+      // disk space on the sessions filesystem (statvfs, best-effort).
+      long long avail_mb = -1, total_mb = -1;
+      {
+        struct statvfs sv;
+        if (::statvfs(c_sessions.c_str(), &sv) == 0 && sv.f_bsize) {
+          avail_mb = static_cast<long long>(sv.f_bavail) * sv.f_bsize / (1024 * 1024);
+          total_mb = static_cast<long long>(sv.f_blocks) * sv.f_bsize / (1024 * 1024);
+        }
+      }
+      char b[2048];
+      std::snprintf(b, sizeof(b),
+                    "{\"ok\":true,\"writable\":%s,\"probe_error\":\"%s\","
+                    "\"fs_avail_mb\":%lld,\"fs_total_mb\":%lld,"
+                    "\"sessions\":{\"dir\":\"%s\",\"count\":%llu,"
+                    "\"oldest\":\"%s\",\"newest\":\"%s\",\"keep\":%d},"
+                    "\"reviews\":{\"dir\":\"%s\",\"count\":%llu,"
+                    "\"oldest\":\"%s\",\"newest\":\"%s\",\"keep\":%d}}",
+                    probe_err.empty() ? "true" : "false",
+                    json_escape(probe_err).c_str(), avail_mb, total_mb,
+                    json_escape(c_sessions).c_str(), (unsigned long long)n_sess,
+                    json_escape(old_sess).c_str(), json_escape(new_sess).c_str(),
+                    c_skeep, json_escape(c_review).c_str(),
+                    (unsigned long long)n_rev, json_escape(old_rev).c_str(),
+                    json_escape(new_rev).c_str(), c_rkeep);
+      return std::string(b);
+    }
     if (line == "RULE") {
       std::string c_model, c_reason, c_rdir;
       double c_thresh = 0, c_max = 0;
@@ -1543,6 +1650,9 @@ struct Daemon {
     } else if (line.rfind("GET /api/events", 0) == 0) {
       auto r = handle_cmd("EVENTS");
       send_resp(cfd, "application/json", r.data(), r.size());
+    } else if (line.rfind("GET /api/disk", 0) == 0) {
+      auto r = handle_cmd("DISK");
+      send_resp(cfd, "application/json", r.data(), r.size());
     } else if (line.rfind("GET /api/start", 0) == 0) {
       auto r = handle_cmd("START");
       send_resp(cfd, "application/json", r.data(), r.size());
@@ -1687,14 +1797,15 @@ const char* Daemon::kIndexHtml =
     "<div class=kv><dt>CPU</dt><dd id=r_cpu>--</dd></div><div class=bar><i id=r_cpu_b></i></div>"
     "<div class=kv><dt>GPU</dt><dd id=r_gpu>--</dd></div><div class=bar><i id=r_gpu_b></i></div>"
     "<div class=kv><dt>MEM</dt><dd id=r_mem>--</dd><dt>TEMP</dt><dd id=r_temp>--</dd>"
-    "<dt>session</dt><dd id=r_sess>--</dd></div></section>"
+    "<dt>session</dt><dd id=r_sess>--</dd><dt>disk</dt><dd id=r_disk>--</dd>"
+    "<dt>sessions</dt><dd id=r_sessn>--</dd><dt>reviews</dt><dd id=r_revn>--</dd></div></section>"
     "<section class=card><h3>Scheduler rule + worker</h3>"
     "<div class=kv><dt>rule model</dt><dd id=w_model>--</dd><dt>reason</dt><dd id=w_reason>--</dd>"
     "<dt>low-conf</dt><dd id=w_low>--</dd><dt>max conf</dt><dd id=w_max>--</dd>"
     "<dt>reviews</dt><dd id=w_rev>--</dd><dt>worker</dt><dd id=w_state>--</dd></div>"
     "<h3 style='margin-top:10px'>Events (cap 200, newest last)</h3><div id=events></div></section>"
     "</main>"
-    "<footer>Data: <code>/snapshot.jpg</code> + <code>/api/{status,rule,worker,dets,meta,metrics,events}</code>"
+    "<footer>Data: <code>/snapshot.jpg</code> + <code>/api/{status,rule,worker,dets,meta,metrics,events,disk}</code>"
     " | Latency clocks: decode/infer/post via steady_clock, GPU time includes enqueue+sync"
     " | RTSP: <code id=rtsp2></code></footer>"
     "<script>"
@@ -1762,6 +1873,11 @@ const char* Daemon::kIndexHtml =
     "(v.events||[]).slice(-40).forEach(e=>{const d=document.createElement('div');"
     "d.className=e.type||'';d.textContent=new Date(e.t*1000).toLocaleTimeString()+' ['+e.type+'] '+e.detail;"
     "box.appendChild(d);});box.scrollTop=box.scrollHeight;}catch(e){}"
+    "try{const dk=await(await fetch('/api/disk')).json();"
+    "$('r_disk').textContent=(dk.writable?'ok ':'NOT WRITABLE ')+(dk.fs_avail_mb>=0?(dk.fs_avail_mb+'/'+dk.fs_total_mb+' MB'):'--')"
+    "+(dk.probe_error?(' ('+dk.probe_error+')'):'');"
+    "$('r_sessn').textContent=dk.sessions.count+' (keep '+dk.sessions.keep+', '+dk.sessions.oldest+'..'+dk.sessions.newest+')';"
+    "$('r_revn').textContent=dk.reviews.count+' (keep '+dk.reviews.keep+')';}catch(e){}"
     "}"
     "setInterval(tick,1000);tick();</script></body></html>";
 
@@ -1784,6 +1900,8 @@ int main(int argc, char** argv) {
       d.review_dir = argv[++i];
     else if (std::strcmp(argv[i], "--review-keep") == 0 && i + 1 < argc)
       d.review_keep = std::atoi(argv[++i]);
+    else if (std::strcmp(argv[i], "--sessions-keep") == 0 && i + 1 < argc)
+      d.sessions_keep = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--http") == 0 && i + 1 < argc)
       d.http_port = std::atoi(argv[++i]);
     else if (std::strcmp(argv[i], "--rtsp") == 0 && i + 1 < argc)

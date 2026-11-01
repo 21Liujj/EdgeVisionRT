@@ -11,10 +11,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
 import time
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("worker.nanoowl")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from paths import (NANOOWL_PKG, NANOSAM_CPP, OWL_ENGINE, RUN_OWL, SAM_DECODER,
@@ -69,7 +77,7 @@ def main() -> int:
     try:
         meta = json.load(open(meta_p))
     except Exception as exc:
-        print(f"[owl_worker] bad meta: {exc}")
+        log.error("bad meta: %s", exc)
         return 2
     crop = os.path.join(review, meta.get("crop", "crop.jpg"))
     if not os.path.isfile(crop):
@@ -90,7 +98,7 @@ def main() -> int:
 
     # 1) OWL detect
     owl_out = os.path.join(review, "owl_out")
-    rc, log = run(["python3", RUN_OWL, "--image", crop, "--prompts", prompts,
+    rc, out = run(["python3", RUN_OWL, "--image", crop, "--prompts", prompts,
                    "--threshold", str(args.owl_threshold),
                    "--engine", OWL_ENGINE, "--model", OWL_MODEL,
                    "--output-dir", owl_out], args.timeout_owl)
@@ -156,8 +164,8 @@ def main() -> int:
     fin = os.path.join(review, "result.json")
     json.dump(result, open(tmp, "w"), indent=1)
     os.rename(tmp, fin)
-    print(json.dumps({k: result[k] for k in ("ok", "lat_ms", "owl_boxes")},
-                     ensure_ascii=False)[:500])
+    log.info("done ok=%s lat_ms=%.1f boxes=%d", result["ok"], result["lat_ms"],
+             len(result["owl_boxes"]))
     return 0
 
 

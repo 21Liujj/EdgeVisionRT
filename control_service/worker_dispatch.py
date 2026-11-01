@@ -11,9 +11,12 @@ Keep the file below as control_service/worker_dispatch.py and import it.
 """
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 import os
+
+log = logging.getLogger("agent.dispatch")
 
 WORKERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workers")
 
@@ -31,11 +34,11 @@ def dispatch_review(sock: str, meta: dict, review_dir: str) -> None:
                            "nanoowl_worker.py" if worker == "nanoowl" else "qwen_worker.py")
     try:
         report_worker(sock, f"{worker}-working")
-        print(f"[agent] WORKER {worker} start {stamp}", flush=True)
+        log.info("WORKER %s start %s", worker, stamp)
         r = subprocess.run([sys.executable, script, "--review", rdir],
                            capture_output=True, text=True, timeout=600)
-        print(f"[agent] WORKER {worker} rc={r.returncode} "
-              f"{(r.stdout + r.stderr)[-300:]}", flush=True)
+        log.info("WORKER %s rc=%d %s", worker, r.returncode,
+                 (r.stdout + r.stderr)[-300:])
         # summarize for web UI (<=120 chars)
         try:
             res = json.load(open(os.path.join(rdir, "result.json")))
@@ -52,10 +55,10 @@ def dispatch_review(sock: str, meta: dict, review_dir: str) -> None:
         time.sleep(1)
         report_worker(sock, "idle")
     except subprocess.TimeoutExpired:
-        print(f"[agent] WORKER {worker} TIMEOUT {stamp}", flush=True)
+        log.warning("WORKER %s TIMEOUT %s", worker, stamp)
         try:
             report_worker(sock, "idle")
         except Exception:
             pass
     except Exception as exc:
-        print(f"[agent] WORKER dispatch failed: {exc}", flush=True)
+        log.error("WORKER dispatch failed: %s", exc)

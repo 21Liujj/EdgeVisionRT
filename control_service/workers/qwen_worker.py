@@ -10,10 +10,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
 import time
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("worker.qwen")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from paths import QWEN_ASK as DEMO
@@ -45,7 +53,7 @@ def main() -> int:
     try:
         meta = json.load(open(os.path.join(review, "meta.json")))
     except Exception as exc:
-        print(f"[qwen_worker] bad meta: {exc}")
+        log.error("bad meta: %s", exc)
         return 2
     crop = os.path.join(review, meta.get("crop", "crop.jpg"))
     question = args.question or meta.get("prompt_qwen") or FIXED_QUESTIONS[0]
@@ -53,13 +61,13 @@ def main() -> int:
     env = dict(os.environ)
     env["EDGELLM_PLUGIN_PATH"] = PLUGIN
     t0 = time.perf_counter()
-    rc, log = run([DEMO, "--image", crop, "--prompt", question,
+    rc, out = run([DEMO, "--image", crop, "--prompt", question,
                    "--max-tokens", "64"], env, args.timeout)
     lat_ms = (time.perf_counter() - t0) * 1000.0
 
     # demo prints answer text + a trailing {...profile json...}; keep last profile line
     text, profile = "", {}
-    for line in reversed(log.strip().splitlines()):
+    for line in reversed(out.strip().splitlines()):
         line = line.strip()
         if line.startswith("{") and "vision_mean_ms" in line:
             try:
@@ -72,7 +80,7 @@ def main() -> int:
             break
     if not text:
         # fallback: last non-empty non-log line
-        for line in reversed(log.strip().splitlines()):
+        for line in reversed(out.strip().splitlines()):
             s = line.strip()
             if s and not s.startswith("[") and not s.startswith("{"):
                 text = s[:500]
@@ -95,8 +103,8 @@ def main() -> int:
     fin = os.path.join(review, "result.json")
     json.dump(result, open(tmp, "w"), indent=1, ensure_ascii=False)
     os.rename(tmp, fin)
-    print(json.dumps({k: result[k] for k in ("ok", "lat_ms", "qwen_text")},
-                     ensure_ascii=False)[:500])
+    log.info("done ok=%s lat_ms=%.1f text=%s", result["ok"], result["lat_ms"],
+             text[:80])
     return 0
 
 

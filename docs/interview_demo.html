@@ -74,6 +74,7 @@
         <img id="view" alt="等待连接板子…">
         <canvas id="ov"></canvas>
       </div>
+      <div id="liveHint" class="hint" style="margin-top:6px">未连接：先填板子 IP 点「连接」，再按 START 进入 RUNNING 才会出画面</div>
       <div class="row" style="margin-top:8px">
         <span id="frameInfo" class="mono hint">frame - · dets -</span>
         <span style="flex:1"></span>
@@ -154,6 +155,7 @@ const $ = id => document.getElementById(id);
 function toast(m){ const t=$("toast"); t.textContent=m; t.style.display="block"; setTimeout(()=>t.style.display="none",1800); }
 function copyRtsp(){ navigator.clipboard && navigator.clipboard.writeText($("rtspUrl").textContent); toast("RTSP 地址已复制"); }
 function setConn(ok, txt){ $("dot").className = "dot" + (ok==null?"":ok?" ok":" bad"); $("connTxt").textContent = txt; }
+function setSnapHint(txt){ const h=$("liveHint"); if(h) h.textContent = txt; }
 async function api(path){
   if(!base){ toast("先点连接"); return; }
   try { const r = await fetch(base+"/api/"+path); toast(path+": "+(await r.text()).slice(0,80)); }
@@ -174,28 +176,67 @@ function restart(){
   timer = setInterval(tick, parseInt($("fps").value||"1000",10));
 }
 async function tick(){
-  // 1) snapshot image (img tag needs no CORS)
-  $("view").src = base + "/snapshot.jpg?t=" + Date.now();
-  // 2) json APIs (need daemon CORS headers — already added in main.cc)
+  // 1) snapshot image (img tag needs no CORS). Use fetch so we can detect
+  // 503 "no frame yet" (daemon IDLE / not STARTed) instead of a black box.
   try {
-    const [d, r, w, s] = await Promise.all([
-      fetch(base+"/api/dets").then(x=>x.json()),
-      fetch(base+"/api/rule").then(x=>x.json()),
-      fetch(base+"/api/worker").then(x=>x.json()),
-      fetch(base+"/api/status").then(x=>x.json()),
-    ]);
+    const r = await fetch(base + "/snapshot.jpg?t=" + Date.now());
+    if (r.ok) {
+      const b = await r.blob();
+      // revoke previous object URL to avoid leaking one URL per tick
+      if ($("view").dataset.obj) URL.revokeObjectURL($("view").dataset.obj);
+      const u = URL.createObjectURL(b);
+      $("view").dataset.obj = u;
+      $("view").src = u;
+    } else {
+      setSnapHint("daemon 还没出图（" + r.status + "）：多半还在 IDLE，先按 START 进 RUNNING");
+    }
+  } catch(e){ setSnapHint("快照取不到：确认 :8080 可达"); }
+  // 2) json APIs (need daemon CORS headers — already added in main.cc).
+  // Fetch independently: one slow/hung endpoint must not blank the others
+  // (Promise.all fails the whole tick if any single fetch rejects).
+  async function getJson(path) {
+    const r = await fetch(base + path);
+    if (!r.ok) throw new Error(path + " HTTP " + r.status);
+    return r.json();
+  }
+  let d = null, r = null, w = null, s = null;
+  const targets = [["/api/dets","dets"],["/api/rule","rule"],["/api/worker","worker"],["/api/status","status"]];
+  const results = await Promise.allSettled(targets.map(([path]) => getJson(path)));
+  let okN = 0, failN = 0;
+  results.forEach((res, i) => {
+    const [path, el] = targets[i];
+    if (res.status === "fulfilled") {
+      const j = res.value;
+      $(el).textContent = JSON.stringify(j, null, 1).slice(0, 900);
+      if (path === "/api/dets") d = j;
+      if (path === "/api/rule") r = j;
+      if (path === "/api/worker") w = j;
+      if (path === "/api/status") s = j;
+      okN++;
+    } else {
+      $(el).textContent = "取不到 " + path + "（" + (res.reason && res.reason.message ? res.reason.message : res.reason) + "）";
+      failN++;
+    }
+  });
+  if (okN > 0) {
     okCount++;
-    setConn(true, "已连接 · "+okCount+" 次");
-    $("frameInfo").textContent = "frame "+d.frame+" · dets "+((d.dets||[]).length);
-    $("dets").textContent = JSON.stringify(d, null, 1).slice(0, 900);
-    $("rule").textContent = JSON.stringify(r, null, 1).slice(0, 900);
-    $("worker").textContent = JSON.stringify(w, null, 1).slice(0, 900);
-    $("status").textContent = JSON.stringify(s, null, 1).slice(0, 900);
-    if(r.low_conf_streak!=null) $("streak").textContent = r.low_conf_streak;
-    if(r.reviews_written!=null) $("reviews").textContent = r.reviews_written;
-    drawBoxes(d.dets||[]);
-  } catch(e){
-    setConn(false, "连不上：确认板子 daemon 在 RUNNING 且 :8080 可达");
+    setConn(failN === 0, failN === 0 ? "已连接 · "+okCount+" 次" : "部分可达 · "+okN+"/4 接口 OK");
+    // state banner: IDLE/STOPPING with frame 0 = not streaming yet
+    if (s && s.state && s.state !== "RUNNING") {
+      setSnapHint("daemon state=" + s.state + "，还没在流：按 START 进入 RUNNING 才会出画面（frame " + ((d && d.frame)||0) + "）");
+    } else if (d && d.frame > 0) {
+      setSnapHint("RUNNING 出图中 · frame " + d.frame + " · src " + d.src_id + "/epoch " + d.epoch);
+    }
+    if (d) {
+      $("frameInfo").textContent = "frame "+d.frame+" · dets "+((d.dets||[]).length);
+      drawBoxes(d.dets||[]);
+    }
+    if (r) {
+      if(r.low_conf_streak!=null) $("streak").textContent = r.low_conf_streak;
+      if(r.reviews_written!=null) $("reviews").textContent = r.reviews_written;
+    }
+  } else {
+    setConn(false, "连不上：确认板子 daemon 存活且 :8080 可达（4/4 接口失败）");
   }
 }
 function drawBoxes(dets){

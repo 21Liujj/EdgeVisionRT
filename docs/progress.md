@@ -3,7 +3,18 @@
 > Rule: code and reports can lie stale; this file is the only place that says
 > "what stage are we at, what evidence exists, what is next".
 
-## Current: M8 fusion + COCO full eval (done, board-verified 2026-10-31)
+## Current: M11 daemon hardening — lock discipline + bounded telemetry (done, host-verified 2026-11-01)
+
+| Item | State | Evidence |
+|---|---|---|
+| `update_snapshot` 640px→480px sx/sy fix | done (host invariant) | `tests/test_m11_daemon_invariants.py` 14/14 pass; `apps/edgevisiond/main.cc:964` |
+| `do_start` blocking I/O out of `mu` (mkdir/fopen/sess.start/join) | done (host invariant) | `do_start` lock only guards state/counters; `STATUS`/`METRICS` sample `/proc`,`/sys` OUTSIDE `mu` then snapshot |
+| Bounded telemetry (lat 600 / events 200 / trend 120) | done (host invariant) | `push_capped`/`trend_add_locked`/`push_event_locked` |
+| `std::system()` shell removal → `std::filesystem` | done (host invariant) | no `std::system` in `main.cc`; `create_directories/directory_iterator/remove_all` |
+| Host regression (m7 rule + m8 contract + m11 invariants) | done (Windows host) | `test_m7_rule.py` 6/6, `test_m8_contract.py` 23/23, `test_m11_daemon_invariants.py` 14/14 |
+| Board verification (build + START/STOP + box overlay + long-run) | TODO (board) | needs `cmake --preset board-native`, START/STOP smoke, snapshot box check |
+
+## Previous: M8 fusion + COCO full eval (done, board-verified 2026-10-31)
 
 | Item | State | Evidence |
 |---|---|---|

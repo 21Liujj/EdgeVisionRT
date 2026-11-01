@@ -11,6 +11,29 @@ FramePool::FramePool(std::size_t slots, std::size_t bytes_per_slot)
   }
 }
 
+int FramePool::acquire_index() {
+  std::lock_guard<std::mutex> lk(mu_);
+  for (std::size_t i = 0; i < frames_.size(); ++i) {
+    if (!busy_[i]) {
+      busy_[i] = true;
+      epochs_[i]++;  // generation bump: old leases with epoch-1 are stale
+      Frame& slot = frames_[i];
+      slot.frame_id = next_id_++;
+      slot.epoch = epochs_[i];
+      slot.valid = false;  // caller must fill data + set valid=true
+      slot.data.clear();   // keep capacity, reset size
+      return static_cast<int>(i);
+    }
+  }
+  return -1;  // pool exhausted: caller must drop/skip, never block capture
+}
+
+Frame& FramePool::slot_ref(int slot) {
+  // Storage is stable after ctor (no resize), so returning a reference is
+  // safe. Bounds-checked; caller validates generation via epoch_of/valid().
+  return frames_.at(static_cast<std::size_t>(slot));
+}
+
 int FramePool::acquire(Frame& out) {
   std::lock_guard<std::mutex> lk(mu_);
   for (std::size_t i = 0; i < frames_.size(); ++i) {

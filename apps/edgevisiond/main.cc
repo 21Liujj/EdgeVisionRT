@@ -31,8 +31,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -41,6 +45,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -128,6 +133,133 @@ uint64_t wall_ns_now() {
   return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
 }
 
+uint64_t mono_ns_now() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
+}
+
+// ---- console helpers: all best-effort, never throw, never block ----
+static std::string read_file_trim(const char* path, std::size_t max_n = 512) {
+  std::ifstream f(path);
+  if (!f) return "";
+  std::string s;
+  std::getline(f, s);
+  if (s.size() > max_n) s.resize(max_n);
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == '\0'))
+    s.pop_back();
+  return s;
+}
+
+static double percentile_sorted(const std::vector<double>& sorted, double q) {
+  if (sorted.empty()) return 0;
+  std::size_t i = static_cast<std::size_t>(q * (sorted.size() - 1));
+  if (i >= sorted.size()) i = sorted.size() - 1;
+  return sorted[i];
+}
+
+// CPU%: delta of /proc/stat idle vs total, cached across calls.
+// Thread-safe (own mutex): may be called from pipeline + control/HTTP threads.
+// Never called under Daemon::mu (does file I/O).
+struct CpuMeter {
+  uint64_t last_idle = 0, last_total = 0;
+  double last_pct = -1;
+  std::mutex cmu;
+  double sample() {
+    std::lock_guard<std::mutex> lk(cmu);
+    std::ifstream f("/proc/stat");
+    if (!f) return -1;
+    std::string tag;
+    uint64_t u, n, s, idle, iow, irq, sir, st;
+    f >> tag >> u >> n >> s >> idle >> iow >> irq >> sir >> st;
+    if (tag != "cpu") return -1;
+    uint64_t idle_all = idle + iow;
+    uint64_t total = u + n + s + idle + iow + irq + sir + st;
+    double out = -1;
+    if (last_total && total > last_total) {
+      uint64_t dt = total - last_total, di = idle_all - last_idle;
+      out = dt ? (100.0 * (dt - di) / dt) : -1;
+      last_pct = out;
+    } else if (last_pct >= 0) {
+      out = last_pct;  // same-tick re-read: return cached, never fake 0
+    }
+    last_idle = idle_all;
+    last_total = total;
+    return out;
+  }
+};
+
+// Jetson GPU load: /sys/devices/gpu.0/load is per-mille (0..1000). -1 = unknown
+// (Orin Nano has no NVENC but the GPU load node still exists; never fake 0).
+static double read_gpu_load() {
+  std::string s = read_file_trim("/sys/devices/gpu.0/load");
+  if (s.empty()) return -1;
+  try {
+    return std::stod(s) / 10.0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+struct MemInfo {
+  long total_mb = -1, avail_mb = -1;
+};
+static MemInfo read_mem() {
+  MemInfo m;
+  std::ifstream f("/proc/meminfo");
+  std::string k;
+  long v;
+  std::string unit;
+  long tot_kb = -1, av_kb = -1;
+  while (f >> k >> v >> unit) {
+    if (k == "MemTotal:") tot_kb = v;
+    if (k == "MemAvailable:") av_kb = v;
+  }
+  if (tot_kb > 0) m.total_mb = tot_kb / 1024;
+  if (av_kb >= 0) m.avail_mb = av_kb / 1024;
+  return m;
+}
+
+// Hottest thermal zone in °C. -1000 = unknown (sensor missing, never fake a temp).
+static double read_temp_c() {
+  double best = -1000;
+  for (int i = 0; i < 16; ++i) {
+    char p[128];
+    std::snprintf(p, sizeof(p), "/sys/class/thermal/thermal_zone%d/temp", i);
+    std::string s = read_file_trim(p);
+    if (s.empty()) continue;
+    try {
+      double c = std::stod(s) / 1000.0;
+      if (c > best) best = c;
+    } catch (...) {
+    }
+  }
+  return best;
+}
+
+static std::string json_escape(const std::string& s) {
+  std::string o;
+  o.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default:
+        if ((unsigned char)c < 0x20) {
+          char b[8];
+          std::snprintf(b, sizeof(b), "\\u%04x", c);
+          o += b;
+        } else {
+          o += c;
+        }
+    }
+  }
+  return o;
+}
+
 std::string session_stamp() {
   std::time_t t = std::time(nullptr);
   struct tm tmv;
@@ -197,6 +329,77 @@ struct Daemon {
   int snap_w = 0, snap_h = 0;
   uint64_t snap_frame = 0;
   std::vector<Det> snap_dets;  // boxes in snap pixel coords
+  uint64_t snap_src_id = 0;    // pipeline frame_no that produced this snapshot
+  uint64_t snap_epoch = 0;     // stream epoch (reset on camera reconnect)
+  uint64_t snap_ts_monotonic_ns = 0;  // capture time of source frame
+  int snap_src_w = 0, snap_src_h = 0;  // source decoded size before 480px downscale
+
+  // ---- console metrics (bounded, never unbounded) ----
+  uint64_t boot_ns_monotonic = 0;  // process start (CLOCK_MONOTONIC)
+  std::string version = "edgevisiond m11-console";
+  std::string board_model;   // lazy-filled from /proc/device-tree/model
+  std::string l4t_version;   // lazy-filled from /etc/nv_tegra_release
+  // per-stage timings (ms), guarded by mu, capped at 600 samples
+  std::vector<double> lat_decode, lat_infer, lat_post;
+  // 1s-bucket trend for the last 120s: {t_wall_s, fps, infer_ms_p50, cpu, gpu, mem_mb}
+  struct TrendPt { uint64_t t = 0; double fps = 0, infer = 0, cpu = 0, gpu = 0; long mem = 0; };
+  std::deque<TrendPt> trend;  // guarded by mu, cap 120
+  uint64_t trend_bucket = 0;  // wall seconds of open bucket
+  uint64_t trend_frames = 0;  // frames in open bucket
+  std::vector<double> trend_lat;  // infer samples in open bucket
+  // bounded event log (cap 200), guarded by mu
+  std::deque<std::string> events;  // JSON strings, newest at back
+  uint64_t start_count = 0, stop_count = 0, recover_count = 0;
+  std::string last_fault;  // last error text for the console fault banner
+  CpuMeter cpu_meter;       // own lock, NEVER under mu (does file I/O)
+  // pipeline-thread-only sys sample cache (no lock; flushed into trend under mu)
+  uint64_t last_sys_sample_mono = 0;
+  double plc_cpu = -1, plc_gpu = -1, plc_temp = -1000;
+  long plc_mem_used = -1, plc_mem_total = -1, plc_mem_avail = -1;
+
+  // mu must be held. Bounded: cap 200, drop oldest. Never throws.
+  void push_event_locked(const char* type, const std::string& detail) {
+    char b[320];
+    std::snprintf(b, sizeof(b), "{\"t\":%llu,\"type\":\"%s\",\"detail\":\"%s\"}",
+                  (unsigned long long)(wall_ns_now() / 1000000000ull), type,
+                  json_escape(detail).c_str());
+    events.emplace_back(b);
+    while (events.size() > 200) events.pop_front();
+  }
+  // mu must be held. All latency vectors capped at 600 (oldest dropped).
+  static void push_capped(std::vector<double>& v, double x) {
+    v.push_back(x);
+    if (v.size() > 600) v.erase(v.begin(), v.begin() + (v.size() - 600));
+  }
+  // mu must be held. 1s-bucket trend accumulator; caller passes infer ms +
+  // pre-sampled system values (sampled OUTSIDE mu in run_one, ~1Hz cached).
+  // Never does file I/O under lock.
+  void trend_add_locked(uint64_t wall_s, double infer_ms, double cpu, double gpu,
+                        long mem_used_mb) {
+    if (trend_bucket == 0) trend_bucket = wall_s;
+    if (wall_s != trend_bucket) {
+      // close bucket: emit one TrendPt (fps = frames in bucket, infer p50)
+      double p50 = 0;
+      if (!trend_lat.empty()) {
+        std::sort(trend_lat.begin(), trend_lat.end());
+        p50 = percentile_sorted(trend_lat, 0.5);
+      }
+      TrendPt pt;
+      pt.t = trend_bucket;
+      pt.fps = static_cast<double>(trend_frames);
+      pt.infer = p50;
+      pt.cpu = cpu;
+      pt.gpu = gpu;
+      pt.mem = mem_used_mb;
+      trend.push_back(pt);
+      while (trend.size() > 120) trend.pop_front();
+      trend_bucket = wall_s;
+      trend_frames = 0;
+      trend_lat.clear();
+    }
+    trend_frames++;
+    trend_lat.push_back(infer_ms);
+  }
 
   // ---- M10 RTSP live monitor: same annotated small frame -> H.264 ----
   edgevision::RtspServer rtsp;
@@ -285,12 +488,21 @@ struct Daemon {
   }
 
   static void prune_oldest(const std::string& dir, int keep) {
-    // best-effort: keep newest `keep` subdirs, remove the rest
-    std::string cmd = "ls -1 '" + dir + "' 2>/dev/null | head -n 1000 | "
-                      "while read d; do echo \"$d\"; done | "
-                      "sort | head -n -" + std::to_string(keep) +
-                      " 2>/dev/null | while read d; do rm -rf '" + dir + "/'\"$d\"; done";
-    std::system(cmd.c_str());
+    // best-effort: keep newest `keep` subdirs, remove the rest.
+    // No shell: explicit readdir + sort + remove (no injection, no fork).
+    try {
+      std::vector<std::string> names;
+      for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.is_directory()) names.push_back(e.path().filename().string());
+      }
+      std::sort(names.begin(), names.end());
+      if (static_cast<int>(names.size()) <= keep) return;
+      for (std::size_t i = 0; i + static_cast<std::size_t>(keep) < names.size(); ++i) {
+        std::error_code ec;
+        std::filesystem::remove_all(std::filesystem::path(dir) / names[i], ec);
+      }
+    } catch (...) {
+    }
   }
 
   // Returns review stamp on success, "" when skipped/failed.
@@ -301,8 +513,11 @@ struct Daemon {
     if (streak_after != 3) return "";  // edge trigger only
     std::string stamp = session_stamp() + "_f" + std::to_string(frame_no);
     std::string rdir = review_dir + "/" + stamp;
-    std::string cmd = "mkdir -p '" + rdir + "'";
-    if (std::system(cmd.c_str()) != 0) return "";
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(rdir, ec);
+      if (ec) return "";
+    }
     // crop: best det expanded 20%, else center 50%
     int cx0 = w / 4, cy0 = h / 4, cx1 = w * 3 / 4, cy1 = h * 3 / 4;
     float best = -1;
@@ -382,57 +597,104 @@ struct Daemon {
   }
 
   // ---- session control (called from control thread) ----
+  // Lock discipline: mu guards state/counters only. Blocking I/O (mkdir,
+  // fopen, sess.start, join) NEVER runs under mu, so STATUS/HTTP stay live.
   bool do_start(std::string& err) {
-    std::lock_guard<std::mutex> lk(mu);
-    if (state != DaemonState::IDLE) {
-      err = std::string("already ") + state_str(state);
-      return false;
+    std::string new_dir;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      if (state != DaemonState::IDLE) {
+        err = std::string("already ") + state_str(state);
+        return false;
+      }
+      state = DaemonState::STARTING;
+      new_dir = sessions_dir + "/" + session_stamp();
+      session_dir = new_dir;  // reserve name so 2nd START sees STARTING
     }
-    state = DaemonState::STARTING;
-    session_dir = sessions_dir + "/" + session_stamp();
-    // mkdir -p sessions/<stamp>
-    std::string cmd = "mkdir -p '" + session_dir + "'";
-    if (std::system(cmd.c_str()) != 0) {
-      state = DaemonState::IDLE;
-      err = "mkdir session dir failed";
-      return false;
+    // create sessions/<stamp> (outside lock: never hold mu across I/O,
+    // no shell: std::filesystem only, no injection via session_stamp)
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(new_dir, ec);
+      if (ec) {
+        std::lock_guard<std::mutex> lk(mu);
+        state = DaemonState::IDLE;
+        session_dir.clear();
+        err = "mkdir session dir failed: " + new_dir + " (" + ec.message() + ")";
+        return false;
+      }
     }
-    std::string ev_tmp = session_dir + "/events.jsonl.tmp";
-    events_fp = std::fopen(ev_tmp.c_str(), "w");
-    if (!events_fp) {
+    std::string ev_tmp = new_dir + "/events.jsonl.tmp";
+    FILE* fp = std::fopen(ev_tmp.c_str(), "w");
+    if (!fp) {
+      std::lock_guard<std::mutex> lk(mu);
       state = DaemonState::IDLE;
-      err = "open events.jsonl.tmp failed";
+      session_dir.clear();
+      err = "open events.jsonl.tmp failed: " + ev_tmp + " (" +
+            std::strerror(errno) + ")";
       return false;
     }
     if (!sess.start(device, 1280, 720, 0x47504A4D /*MJPG*/, 6, 4, 4)) {
-      std::fclose(events_fp);
-      events_fp = nullptr;
+      std::fclose(fp);
+      std::lock_guard<std::mutex> lk(mu);
       state = DaemonState::IDLE;
       err = "session start: " + sess.last_error();
+      session_dir.clear();
       return false;
     }
     // accepted: driver really streaming now
-    frames_ok = 0;
-    decode_fail = 0;
-    infer_fail = 0;
-    timeouts = 0;
-    dets_total = 0;
-    low_conf_frames = 0;
-    low_conf_streak = 0;
-    last_max_conf = 0;
-    active_model = "yolo";
-    rule_reason = "default: yolo everyday";
-    worker_state = "idle";
-    worker_detail.clear();
-    reviews_written = 0;
-    latencies.clear();
-    stop_session = false;
-    state = DaemonState::RUNNING;
+    // Defensive: STARTING can only be left behind if a second control executor
+    // is added later (today control is single-threaded). On abort, stop the
+    // already-streaming session + close fp outside mu (no join/IO under lock).
+    bool aborted = false;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      if (state != DaemonState::STARTING) {
+        err = std::string("aborted (state=") + state_str(state) + ")";
+        session_dir.clear();
+        aborted = true;
+      }
+    }
+    if (aborted) {
+      sess.stop();
+      std::fclose(fp);
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      events_fp = fp;
+      frames_ok = 0;
+      decode_fail = 0;
+      infer_fail = 0;
+      timeouts = 0;
+      dets_total = 0;
+      low_conf_frames = 0;
+      low_conf_streak = 0;
+      last_max_conf = 0;
+      active_model = "yolo";
+      rule_reason = "default: yolo everyday";
+      worker_state = "idle";
+      worker_detail.clear();
+      reviews_written = 0;
+      latencies.clear();
+      lat_decode.clear();
+      lat_infer.clear();
+      lat_post.clear();
+      trend.clear();
+      trend_bucket = 0;
+      trend_frames = 0;
+      trend_lat.clear();
+      start_count++;
+      push_event_locked("start", new_dir);
+      stop_session = false;
+      state = DaemonState::RUNNING;
+    }
     pipeline_thread = std::thread(&Daemon::pipeline_loop, this);
     return true;
   }
 
   bool do_stop(std::string& err) {
+    std::string dir;
     {
       std::lock_guard<std::mutex> lk(mu);
       if (state != DaemonState::RUNNING) {
@@ -440,6 +702,7 @@ struct Daemon {
         return false;
       }
       state = DaemonState::STOPPING;
+      dir = session_dir;
     }
     stop_session = true;
     if (pipeline_thread.joinable()) pipeline_thread.join();
@@ -450,19 +713,23 @@ struct Daemon {
       std::fclose(events_fp);
       events_fp = nullptr;
     }
-    if (!write_summary(err)) {
+    if (!write_summary(dir, err)) {
       std::lock_guard<std::mutex> lk(mu);
       state = DaemonState::IDLE;
+      last_fault = err;
+      push_event_locked("fault", err);
       return false;
     }
     {
       std::lock_guard<std::mutex> lk(mu);
       state = DaemonState::IDLE;
+      stop_count++;
+      push_event_locked("stop", dir);
     }
     return true;
   }
 
-  bool write_summary(std::string& err) {
+  bool write_summary(const std::string& dir, std::string& err) {
     auto st = sess.stats();
     std::vector<double> lat;
     uint64_t dets = 0, ok = 0;
@@ -481,8 +748,8 @@ struct Daemon {
       mn = lat.front();
       mx = lat.back();
     }
-    std::string tmp = session_dir + "/summary.json.tmp";
-    std::string fin = session_dir + "/summary.json";
+    std::string tmp = dir + "/summary.json.tmp";
+    std::string fin = dir + "/summary.json";
     FILE* fp = std::fopen(tmp.c_str(), "w");
     if (!fp) {
       err = "open summary.json.tmp failed";
@@ -503,8 +770,8 @@ struct Daemon {
       err = "rename summary.json failed";
       return false;
     }
-    std::string ev_tmp = session_dir + "/events.jsonl.tmp";
-    std::string ev_fin = session_dir + "/events.jsonl";
+    std::string ev_tmp = dir + "/events.jsonl.tmp";
+    std::string ev_fin = dir + "/events.jsonl";
     if (std::rename(ev_tmp.c_str(), ev_fin.c_str()) != 0) {
       err = "rename events.jsonl failed";
       return false;
@@ -535,6 +802,7 @@ struct Daemon {
 
   void run_one(edgevision::FrameLease& lease, std::vector<float>& output, uint64_t frame_no,
                bool record) {
+    auto t_dec0 = std::chrono::steady_clock::now();
     std::vector<uint8_t> bgr;
     int dec_w = 0, dec_h = 0;
     std::string dec_err;
@@ -542,11 +810,17 @@ struct Daemon {
                                          dec_h, dec_err)) {
       std::lock_guard<std::mutex> lk(mu);
       decode_fail++;
+      last_fault = "mjpeg decode failed";
       return;
     }
+    auto t_dec1 = std::chrono::steady_clock::now();
+    double lat_dec =
+        std::chrono::duration_cast<std::chrono::microseconds>(t_dec1 - t_dec0).count() / 1000.0;
+    uint64_t src_ts_mono = lease->ts_ns_monotonic;
+    uint64_t src_epoch = lease->epoch;
     std::size_t need = static_cast<std::size_t>(dec_w) * dec_h * 3;
     cudaMemcpy(bgr_gpu, bgr.data(), need, cudaMemcpyHostToDevice);
-    auto t0 = std::chrono::steady_clock::now();
+    auto t_inf0 = std::chrono::steady_clock::now();
     edgevision::cuda_preprocess::preprocess(static_cast<const uint8_t*>(bgr_gpu), dec_w,
                                             dec_h,
                                             static_cast<float*>(engine.input_gpu()), target_w,
@@ -554,28 +828,59 @@ struct Daemon {
     if (!engine.infer(stream)) {
       std::lock_guard<std::mutex> lk(mu);
       infer_fail++;
+      last_fault = "trt infer failed";
+      push_event_locked("fault", last_fault);
       return;
     }
     cudaStreamSynchronize(stream);
-    auto t1 = std::chrono::steady_clock::now();
-    double lat_ms =
-        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+    auto t_inf1 = std::chrono::steady_clock::now();
+    double lat_inf =
+        std::chrono::duration_cast<std::chrono::microseconds>(t_inf1 - t_inf0).count() / 1000.0;
     cudaMemcpy(output.data(), engine.output_gpu(), output.size() * sizeof(float),
                cudaMemcpyDeviceToHost);
+    auto t_post0 = std::chrono::steady_clock::now();
     auto dets = postprocess(output.data(), num_anchors, num_classes, conf_thresh, iou_thresh);
-    update_snapshot(bgr, dec_w, dec_h, dets);
+    auto t_post1 = std::chrono::steady_clock::now();
+    double lat_post =
+        std::chrono::duration_cast<std::chrono::microseconds>(t_post1 - t_post0).count() / 1000.0;
+    double lat_ms = lat_dec + lat_inf + lat_post;
+    update_snapshot(bgr, dec_w, dec_h, dets, frame_no, src_ts_mono, src_epoch);
     if (!record) return;
-    // ---- M7 rule + M8a review dump (metadata + throttled disk I/O) ----
+    // ---- sys sample OUTSIDE mu (~1Hz cache, pipeline-thread-local, no lock)
+    // CpuMeter has its own lock; /proc + /sys reads never run under mu.
+    uint64_t mono_now = mono_ns_now();
+    if (last_sys_sample_mono == 0 || mono_now - last_sys_sample_mono >= 1000000000ull) {
+      plc_cpu = cpu_meter.sample();
+      plc_gpu = read_gpu_load();
+      plc_temp = read_temp_c();
+      MemInfo sm = read_mem();
+      plc_mem_total = sm.total_mb;
+      plc_mem_avail = sm.avail_mb;
+      plc_mem_used =
+          (sm.total_mb > 0 && sm.avail_mb >= 0) ? (sm.total_mb - sm.avail_mb) : -1;
+      last_sys_sample_mono = mono_now;
+    }
+    // ---- M7 rule + M8a review dump (disk I/O OUTSIDE mu; mu is counters only)
+    double mx = 0;
+    for (const auto& d : dets) mx = std::max(mx, static_cast<double>(d.conf));
+    bool low;
+    uint64_t streak_after = 0;
+    bool want_dump = false;
+    uint64_t wall_ns = wall_ns_now();
+    std::string cur_rule;
     {
       std::lock_guard<std::mutex> lk(mu);
       frames_ok++;
       dets_total += dets.size();
-      latencies.push_back(lat_ms);
+      push_capped(latencies, lat_ms);
+      push_capped(lat_decode, lat_dec);
+      push_capped(lat_infer, lat_inf);
+      push_capped(lat_post, lat_post);
+      trend_add_locked(wall_ns / 1000000000ull, lat_inf, plc_cpu, plc_gpu,
+                       plc_mem_used);
       // ---- M7 rule hint (metadata only, no pipeline change) ----
-      double mx = 0;
-      for (const auto& d : dets) mx = std::max(mx, static_cast<double>(d.conf));
       last_max_conf = mx;
-      bool low = (dets.empty() || mx < low_conf_thresh);
+      low = (dets.empty() || mx < low_conf_thresh);
       if (low) {
         low_conf_frames++;
         low_conf_streak++;
@@ -595,47 +900,47 @@ struct Daemon {
         active_model = "yolo";
         rule_reason = "default: yolo everyday";
       }
-      // ---- M8a: edge-triggered review dump (streak 0->3 exactly once) ----
-      // Dump AFTER rule fields are final; writes crop.jpg + meta.json atomically.
-      // JPEG encode may take ~10-30ms: acceptable (once per streak, not per frame).
-      std::string review_stamp;
-      bool want_dump = (record && low && low_conf_streak == 3);
-      uint64_t wall_ns = wall_ns_now();
-      if (events_fp) {
-        std::fprintf(events_fp, "{\"frame\":%llu,\"ts_wall_ns\":%llu,\"lat_ms\":%.2f,"
-                                "\"dets\":%zu,\"max_conf\":%.3f,\"low_conf\":%d,"
-                                "\"rule\":\"%s\"}\n",
-                     (unsigned long long)frame_no, (unsigned long long)wall_ns, lat_ms,
-                     dets.size(), mx, low ? 1 : 0, active_model.c_str());
-      }
-      if (want_dump) reviews_written++;  // count attempt; result row follows
-      uint64_t my_reviews = reviews_written;
-      (void)my_reviews;
+      cur_rule = active_model;
+      streak_after = low_conf_streak;
+      want_dump = (record && low && low_conf_streak == 3);
       if (want_dump) {
-        // NOTE: disk I/O intentionally under mu for M8a (simple + race-free review
-        // counting). JPEG encode ~10-30ms once per streak, not per frame; socket/HTTP
-        // threads take mu only briefly, no deadlock (no lock ordering inversion:
-        // this is the only place pipeline takes mu across I/O).
-        review_stamp = maybe_dump_review(frame_no, bgr, dec_w, dec_h, dets, mx,
-                                         dets.empty(), 3);
-        if (!review_stamp.empty()) {
-          if (events_fp) {
-            std::fprintf(events_fp, "{\"frame\":%llu,\"ts_wall_ns\":%llu,"
-                                    "\"escalated\":true,\"review\":\"%s\"}\n",
-                         (unsigned long long)frame_no, (unsigned long long)wall_ns_now(),
-                         review_stamp.c_str());
-          }
-        } else {
-          // dump failed: keep streak/stats, just no review dir this time
-          reviews_written--;
+        reviews_written++;  // count attempt; rolled back below on failure
+      }
+    }
+    if (events_fp) {
+      std::fprintf(events_fp, "{\"frame\":%llu,\"ts_wall_ns\":%llu,\"lat_ms\":%.2f,"
+                              "\"dec_ms\":%.2f,\"inf_ms\":%.2f,\"post_ms\":%.2f,"
+                              "\"dets\":%zu,\"max_conf\":%.3f,\"low_conf\":%d,"
+                              "\"rule\":\"%s\"}\n",
+                   (unsigned long long)frame_no, (unsigned long long)wall_ns, lat_ms,
+                   lat_dec, lat_inf, lat_post, dets.size(), mx, low ? 1 : 0,
+                   cur_rule.c_str());
+    }
+    if (want_dump) {
+      // Heavy JPEG + mkdir + rename fully outside mu: STATUS/HTTP never block.
+      std::string review_stamp =
+          maybe_dump_review(frame_no, bgr, dec_w, dec_h, dets, mx, dets.empty(), 3);
+      std::lock_guard<std::mutex> lk(mu);
+      if (!review_stamp.empty()) {
+        push_event_locked("review", review_stamp);
+        if (events_fp) {
+          std::fprintf(events_fp, "{\"frame\":%llu,\"ts_wall_ns\":%llu,"
+                                  "\"escalated\":true,\"review\":\"%s\"}\n",
+                       (unsigned long long)frame_no, (unsigned long long)wall_ns_now(),
+                       review_stamp.c_str());
         }
+      } else {
+        // dump failed: keep streak/stats, just no review dir this time
+        reviews_written--;
+        last_fault = "review dump failed";
       }
     }
   }
 
   // ---- web snapshot: downscale to 480px wide, draw boxes, store ----
   void update_snapshot(const std::vector<uint8_t>& bgr, int w, int h,
-                       const std::vector<Det>& dets) {
+                       const std::vector<Det>& dets, uint64_t frame_no,
+                       uint64_t src_ts_mono_ns, uint64_t src_epoch) {
     if (http_port <= 0 || w <= 0 || h <= 0) return;
     const int dst_w = 480;
     const int dst_h = std::max(1, h * dst_w / w);
@@ -657,9 +962,12 @@ struct Daemon {
     std::vector<Det> px;
     px.reserve(dets.size());
     for (const auto& d : dets) {
-      // model coords are normalized cx,cy,w,h in [0,1]
-      float cx = d.x * dst_w, cy = d.y * dst_h;
-      float bw = d.w * dst_w, bh = d.h * dst_h;
+      // model coords are PIXELS in target_w x target_h space (NOT normalized).
+      // Preprocess is a direct full-frame stretch (no letterbox), so scale by
+      // sx/sy into the 480px snapshot. (Fix: was scaling by dst_w directly,
+      // which collapsed boxes to the edge.)
+      float cx = d.x * sx, cy = d.y * sy;
+      float bw = d.w * sx, bh = d.h * sy;
       int x0 = std::max(0, static_cast<int>(cx - bw / 2));
       int y0 = std::max(0, static_cast<int>(cy - bh / 2));
       int x1 = std::min(dst_w - 1, static_cast<int>(cx + bw / 2));
@@ -698,14 +1006,17 @@ struct Daemon {
       px.push_back({static_cast<float>(x0), static_cast<float>(y0),
                     static_cast<float>(x1 - x0), static_cast<float>(y1 - y0), d.conf,
                     d.cls});
-      (void)sx;
-      (void)sy;
     }
     std::lock_guard<std::mutex> lk(snap_mu);
     snap_bgr.swap(small);
     snap_w = dst_w;
     snap_h = dst_h;
     snap_frame++;
+    snap_src_id = frame_no;
+    snap_ts_monotonic_ns = src_ts_mono_ns;
+    snap_epoch = src_epoch;
+    snap_src_w = w;
+    snap_src_h = h;
     snap_dets.swap(px);
     // M10: push annotated frame to RTSP (drop-oldest, never blocks).
     // Lazy-start on first real frame so width/height always match.
@@ -748,11 +1059,60 @@ struct Daemon {
   }
 
   // ---- control socket ----
+  // Board info is filled once at startup (run()) and never does file I/O
+  // under mu. No lazy fill here: STATUS/META/METRICS never touch /proc,/sys
+  // while holding mu (samples are taken before locking, see handle_cmd).
+
   std::string handle_cmd(const std::string& line) {
     if (line == "STATUS") {
-      std::lock_guard<std::mutex> lk(mu);
-      auto st = sess.stats();
-      char buf[2048];
+      // Sample sys files OUTSIDE mu (never hold mu across /proc,/sys I/O).
+      MemInfo mi = read_mem();
+      double temp = read_temp_c();
+      double gpu = read_gpu_load();
+      double cpu = cpu_meter.sample();
+      // Snapshot counters under mu; format JSON after lock is released.
+      DaemonState st_state;
+      uint64_t c_frames_ok, c_decode_fail, c_infer_fail, c_timeouts;
+      uint64_t c_low_conf_frames, c_low_conf_streak, c_reviews;
+      double c_last_max_conf;
+      uint64_t c_start_count, c_stop_count;
+      std::string c_session, c_model, c_reason, c_worker, c_fault;
+      uint64_t c_pool_drop, c_queue_drop;
+      std::vector<double> sl;
+      uint64_t now_mono;
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        auto sst = sess.stats();
+        c_pool_drop = sst.frames_dropped_pool.load();
+        c_queue_drop = sst.frames_dropped_queue.load();
+        sl = latencies;
+        st_state = state;
+        c_frames_ok = frames_ok;
+        c_decode_fail = decode_fail;
+        c_infer_fail = infer_fail;
+        c_timeouts = timeouts;
+        c_session = session_dir;
+        c_model = active_model;
+        c_reason = rule_reason;
+        c_low_conf_frames = low_conf_frames;
+        c_low_conf_streak = low_conf_streak;
+        c_last_max_conf = last_max_conf;
+        c_reviews = reviews_written;
+        c_worker = worker_state;
+        c_start_count = start_count;
+        c_stop_count = stop_count;
+        c_fault = last_fault;
+        now_mono = mono_ns_now();
+      }
+      std::sort(sl.begin(), sl.end());
+      double avg = 0, p50 = 0, p99 = 0;
+      if (!sl.empty()) {
+        avg = std::accumulate(sl.begin(), sl.end(), 0.0) / sl.size();
+        p50 = percentile_sorted(sl, 0.5);
+        p99 = percentile_sorted(sl, 0.99);
+      }
+      uint64_t up_s = boot_ns_monotonic ? (now_mono - boot_ns_monotonic) / 1000000000ull : 0;
+      char buf[4096];
       std::snprintf(buf, sizeof(buf),
                     "{\"ok\":true,\"state\":\"%s\",\"frames\":%llu,\"decode_fail\":%llu,"
                     "\"infer_fail\":%llu,\"timeouts\":%llu,\"pool_drop\":%llu,"
@@ -760,30 +1120,168 @@ struct Daemon {
                     "\"active_model\":\"%s\",\"rule_reason\":\"%s\","
                     "\"low_conf_frames\":%llu,\"low_conf_streak\":%llu,"
                     "\"last_max_conf\":%.3f,"
-                    "\"reviews_written\":%llu,\"worker\":\"%s\"}",
-                    state_str(state), (unsigned long long)frames_ok,
-                    (unsigned long long)decode_fail, (unsigned long long)infer_fail,
-                    (unsigned long long)timeouts,
-                    (unsigned long long)st.frames_dropped_pool.load(),
-                    (unsigned long long)st.frames_dropped_queue.load(), session_dir.c_str(),
-                    active_model.c_str(), rule_reason.c_str(),
-                    (unsigned long long)low_conf_frames,
-                    (unsigned long long)low_conf_streak, last_max_conf,
-                    (unsigned long long)reviews_written, worker_state.c_str());
+                    "\"reviews_written\":%llu,\"worker\":\"%s\","
+                    "\"lat_avg_ms\":%.2f,\"lat_p50_ms\":%.2f,\"lat_p99_ms\":%.2f,"
+                    "\"uptime_s\":%llu,\"start_count\":%llu,\"stop_count\":%llu,"
+                    "\"cpu_pct\":%.1f,\"gpu_pct\":%.1f,\"mem_total_mb\":%ld,"
+                    "\"mem_avail_mb\":%ld,\"temp_c\":%.1f,"
+                    "\"last_fault\":\"%s\"}",
+                    state_str(st_state), (unsigned long long)c_frames_ok,
+                    (unsigned long long)c_decode_fail, (unsigned long long)c_infer_fail,
+                    (unsigned long long)c_timeouts,
+                    (unsigned long long)c_pool_drop,
+                    (unsigned long long)c_queue_drop, c_session.c_str(),
+                    c_model.c_str(), c_reason.c_str(),
+                    (unsigned long long)c_low_conf_frames,
+                    (unsigned long long)c_low_conf_streak, c_last_max_conf,
+                    (unsigned long long)c_reviews, c_worker.c_str(),
+                    avg, p50, p99, (unsigned long long)up_s,
+                    (unsigned long long)c_start_count, (unsigned long long)c_stop_count,
+                    cpu, gpu,
+                    mi.total_mb, mi.avail_mb, temp,
+                    json_escape(c_fault).c_str());
       return std::string(buf);
     }
+    if (line == "META") {
+      // Snapshot under mu; format outside (never hold mu across formatting).
+      std::string c_ver, c_board, c_l4t, c_eng, c_dev, c_sock;
+      int c_tw = 0, c_th = 0, c_nc = 0, c_http = 0, c_rtsp = 0;
+      uint64_t c_up = 0;
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        c_ver = version;
+        c_board = board_model;
+        c_l4t = l4t_version;
+        c_eng = engine_path;
+        c_tw = target_w;
+        c_th = target_h;
+        c_nc = num_classes;
+        c_dev = device;
+        c_sock = sock_path;
+        c_http = http_port;
+        c_rtsp = rtsp_port;
+        uint64_t now_mono = mono_ns_now();
+        c_up = boot_ns_monotonic ? (now_mono - boot_ns_monotonic) / 1000000000ull : 0;
+      }
+      std::string j = "{\"ok\":true,\"version\":\"" + json_escape(c_ver) + "\""
+                      ",\"board_model\":\"" + json_escape(c_board) + "\""
+                      ",\"l4t\":\"" + json_escape(c_l4t) + "\""
+                      ",\"engine\":\"" + json_escape(c_eng) + "\""
+                      ",\"input_wh\":[" + std::to_string(c_tw) + "," +
+                      std::to_string(c_th) + "]"
+                      ",\"num_classes\":" + std::to_string(c_nc) +
+                      ",\"device\":\"" + json_escape(c_dev) + "\""
+                      ",\"sock\":\"" + json_escape(c_sock) + "\""
+                      ",\"http_port\":" + std::to_string(c_http) +
+                      ",\"rtsp_port\":" + std::to_string(c_rtsp) +
+                      ",\"uptime_s\":" + std::to_string(c_up) + "}";
+      return j;
+    }
+    if (line == "METRICS") {
+      // Sample sys files OUTSIDE mu; copy vectors/trend under mu; format after.
+      MemInfo mmi = read_mem();
+      double mtemp = read_temp_c();
+      double mgpu = read_gpu_load();
+      double mcpu = cpu_meter.sample();
+      std::vector<double> c_dec, c_inf, c_post;
+      std::deque<TrendPt> c_trend;
+      uint64_t c_qpeak = 0, c_pdrop = 0, c_qdrop = 0;
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        auto sst = sess.stats();
+        c_qpeak = sst.queue_peak_depth.load();
+        c_pdrop = sst.frames_dropped_pool.load();
+        c_qdrop = sst.frames_dropped_queue.load();
+        c_dec = lat_decode;
+        c_inf = lat_infer;
+        c_post = lat_post;
+        c_trend = trend;
+      }
+      auto pct = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        double a = 0, p5 = 0, p9 = 0;
+        if (!v.empty()) {
+          a = std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+          p5 = percentile_sorted(v, 0.5);
+          p9 = percentile_sorted(v, 0.99);
+        }
+        char b[128];
+        std::snprintf(b, sizeof(b), "{\"avg\":%.2f,\"p50\":%.2f,\"p99\":%.2f,\"n\":%zu}",
+                      a, p5, p9, v.size());
+        return std::string(b);
+      };
+      MemInfo mi = mmi;
+      double temp = mtemp;
+      std::string j = "{\"ok\":true,\"decode\":" + pct(c_dec) + ",\"infer\":" + pct(c_inf) +
+                      ",\"post\":" + pct(c_post);
+      char b[256];
+      std::snprintf(b, sizeof(b),
+                    ",\"queue_peak\":%llu,\"pool_drop\":%llu,\"queue_drop\":%llu,"
+                    "\"mem_total_mb\":%ld,\"mem_avail_mb\":%ld,"
+                    "\"cpu_pct\":%.1f,\"gpu_pct\":%.1f,\"temp_c\":%.1f,\"trend_n\":%zu}",
+                    (unsigned long long)c_qpeak,
+                    (unsigned long long)c_pdrop,
+                    (unsigned long long)c_qdrop, mi.total_mb,
+                    mi.avail_mb, mcpu, mgpu, temp,
+                    c_trend.size());
+      j += b;
+      // trend array (last 120 buckets)
+      j += ",\"trend\":[";
+      bool first = true;
+      for (auto& t : c_trend) {
+        if (!first) j += ",";
+        first = false;
+        char tb[192];
+        std::snprintf(tb, sizeof(tb),
+                      "{\"t\":%llu,\"fps\":%.1f,\"infer\":%.2f,\"cpu\":%.1f,\"gpu\":%.1f,"
+                      "\"mem\":%ld}",
+                      (unsigned long long)t.t, t.fps, t.infer, t.cpu, t.gpu, t.mem);
+        j += tb;
+      }
+      j += "]}";
+      return j;
+    }
+    if (line == "EVENTS") {
+      std::deque<std::string> c_events;
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        c_events = events;
+      }
+      std::string j = "{\"ok\":true,\"events\":[";
+      bool first = true;
+      for (auto& e : c_events) {
+        if (!first) j += ",";
+        first = false;
+        j += e;
+      }
+      j += "]}";
+      return j;
+    }
     if (line == "RULE") {
-      std::lock_guard<std::mutex> lk(mu);
+      std::string c_model, c_reason, c_rdir;
+      double c_thresh = 0, c_max = 0;
+      uint64_t c_lcf = 0, c_lcs = 0, c_rev = 0;
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        c_model = active_model;
+        c_reason = rule_reason;
+        c_thresh = low_conf_thresh;
+        c_lcf = low_conf_frames;
+        c_lcs = low_conf_streak;
+        c_max = last_max_conf;
+        c_rev = reviews_written;
+        c_rdir = review_dir;
+      }
       char buf[1024];
       std::snprintf(buf, sizeof(buf),
                     "{\"ok\":true,\"active_model\":\"%s\",\"reason\":\"%s\","
                     "\"low_conf_thresh\":%.2f,\"low_conf_frames\":%llu,"
                     "\"low_conf_streak\":%llu,\"last_max_conf\":%.3f,"
                     "\"reviews_written\":%llu,\"review_dir\":\"%s\"}",
-                    active_model.c_str(), rule_reason.c_str(), low_conf_thresh,
-                    (unsigned long long)low_conf_frames,
-                    (unsigned long long)low_conf_streak, last_max_conf,
-                    (unsigned long long)reviews_written, review_dir.c_str());
+                    c_model.c_str(), c_reason.c_str(), c_thresh,
+                    (unsigned long long)c_lcf,
+                    (unsigned long long)c_lcs, c_max,
+                    (unsigned long long)c_rev, c_rdir.c_str());
       return std::string(buf);
     }
     if (line.rfind("WORKER ", 0) == 0) {
@@ -797,17 +1295,27 @@ struct Daemon {
       return "{\"ok\":true}";
     }
     if (line == "WORKER") {
-      std::lock_guard<std::mutex> lk(mu);
-      return "{\"ok\":true,\"worker\":\"" + worker_state + "\",\"reviews\":" +
-             std::to_string(reviews_written) + "}";
+      std::string c_worker;
+      uint64_t c_rev = 0;
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        c_worker = worker_state;
+        c_rev = reviews_written;
+      }
+      return "{\"ok\":true,\"worker\":\"" + c_worker + "\",\"reviews\":" +
+             std::to_string(c_rev) + "}";
     }
     if (line == "START") {
       std::string err;
       if (do_start(err)) {
-        std::lock_guard<std::mutex> lk(mu);
+        std::string c_session;
+        {
+          std::lock_guard<std::mutex> lk(mu);
+          c_session = session_dir;
+        }
         char buf[256];
         std::snprintf(buf, sizeof(buf), "{\"ok\":true,\"accepted\":true,\"session\":\"%s\"}",
-                      session_dir.c_str());
+                      c_session.c_str());
         return std::string(buf);
       }
       return "{\"ok\":false,\"error\":\"" + err + "\"}";
@@ -846,12 +1354,20 @@ struct Daemon {
     while (!stop_control && !g_stop_process) {
       int cfd = ::accept(listen_fd, nullptr, nullptr);
       if (cfd < 0) {
-        // idle: heartbeat every ~5s for journald
+        // idle: heartbeat every ~5s for journald (snapshot under mu, print outside)
         if (++tick % 5 == 0) {
-          std::lock_guard<std::mutex> lk(mu);
+          DaemonState hb_state;
+          uint64_t hb_frames;
+          std::string hb_session;
+          {
+            std::lock_guard<std::mutex> lk(mu);
+            hb_state = state;
+            hb_frames = frames_ok;
+            hb_session = session_dir;
+          }
           std::printf("[edgevisiond] heartbeat state=%s frames=%llu session=%s\n",
-                      state_str(state), (unsigned long long)frames_ok,
-                      session_dir.empty() ? "-" : session_dir.c_str());
+                      state_str(hb_state), (unsigned long long)hb_frames,
+                      hb_session.empty() ? "-" : hb_session.c_str());
           std::fflush(stdout);
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -972,9 +1488,13 @@ struct Daemon {
       auto jpg = snapshot();
       if (jpg.empty()) {
         const char* nf = "no frame yet";
-        char head[128];
+        char head[256];
         int hl = std::snprintf(head, sizeof(head),
-                               "HTTP/1.0 503 Busy\r\nContent-Length: %zu\r\n\r\n",
+                               "HTTP/1.0 503 Busy\r\nContent-Type: text/plain\r\n"
+                               "Content-Length: %zu\r\nCache-Control: no-cache\r\n"
+                               "Access-Control-Allow-Origin: *\r\n"
+                               "Access-Control-Allow-Methods: GET, OPTIONS\r\n"
+                               "Connection: close\r\n\r\n",
                                std::strlen(nf));
         send_all(cfd, head, hl);
         send_all(cfd, nf, std::strlen(nf));
@@ -991,19 +1511,38 @@ struct Daemon {
       auto r = handle_cmd("WORKER");
       send_resp(cfd, "application/json", r.data(), r.size());
     } else if (line.rfind("GET /api/dets", 0) == 0) {
-      std::lock_guard<std::mutex> lk(snap_mu);
-      std::string j = "{\"frame\":" + std::to_string(snap_frame) + ",\"dets\":[";
-      for (std::size_t i = 0; i < snap_dets.size(); ++i) {
-        if (i) j += ",";
-        char b[160];
-        std::snprintf(b, sizeof(b), "{\"x\":%.0f,\"y\":%.0f,\"w\":%.0f,\"h\":%.0f,"
-                                    "\"conf\":%.2f,\"cls\":%d}",
-                      snap_dets[i].x, snap_dets[i].y, snap_dets[i].w, snap_dets[i].h,
-                      snap_dets[i].conf, snap_dets[i].cls);
-        j += b;
+      std::string j;
+      {
+        std::lock_guard<std::mutex> lk(snap_mu);
+        j = "{\"frame\":" + std::to_string(snap_frame) +
+            ",\"src_id\":" + std::to_string(snap_src_id) +
+            ",\"epoch\":" + std::to_string(snap_epoch) +
+            ",\"ts_mono_ns\":" + std::to_string(snap_ts_monotonic_ns) +
+            ",\"src_wh\":[" + std::to_string(snap_src_w) + "," +
+            std::to_string(snap_src_h) + "]"
+            ",\"snap_wh\":[" + std::to_string(snap_w) + "," + std::to_string(snap_h) +
+            "],\"dets\":[";
+        for (std::size_t i = 0; i < snap_dets.size(); ++i) {
+          if (i) j += ",";
+          char b[160];
+          std::snprintf(b, sizeof(b), "{\"x\":%.0f,\"y\":%.0f,\"w\":%.0f,\"h\":%.0f,"
+                                      "\"conf\":%.2f,\"cls\":%d}",
+                        snap_dets[i].x, snap_dets[i].y, snap_dets[i].w, snap_dets[i].h,
+                        snap_dets[i].conf, snap_dets[i].cls);
+          j += b;
+        }
+        j += "]}";
       }
-      j += "]}";
       send_resp(cfd, "application/json", j.data(), j.size());
+    } else if (line.rfind("GET /api/meta", 0) == 0) {
+      auto r = handle_cmd("META");
+      send_resp(cfd, "application/json", r.data(), r.size());
+    } else if (line.rfind("GET /api/metrics", 0) == 0) {
+      auto r = handle_cmd("METRICS");
+      send_resp(cfd, "application/json", r.data(), r.size());
+    } else if (line.rfind("GET /api/events", 0) == 0) {
+      auto r = handle_cmd("EVENTS");
+      send_resp(cfd, "application/json", r.data(), r.size());
     } else if (line.rfind("GET /api/start", 0) == 0) {
       auto r = handle_cmd("START");
       send_resp(cfd, "application/json", r.data(), r.size());
@@ -1018,6 +1557,14 @@ struct Daemon {
   int run() {
     std::signal(SIGTERM, on_signal);
     std::signal(SIGINT, on_signal);
+    boot_ns_monotonic = mono_ns_now();
+    // Board identity once at startup (no per-request file I/O under mu).
+    board_model = read_file_trim("/proc/device-tree/model");
+    {
+      std::string l = read_file_trim("/etc/nv_tegra_release", 4096);
+      auto nl = l.find('\n');
+      l4t_version = (nl == std::string::npos) ? l : l.substr(0, nl);
+    }
     if (!init_cuda()) {
       std::fprintf(stderr, "[edgevisiond] FAIL %s\n", last_error.c_str());
       return 1;
@@ -1067,52 +1614,155 @@ struct Daemon {
 }  // namespace
 
 const char* Daemon::kIndexHtml =
-    "<!doctype html><html><head><meta charset=utf-8>"
+    "<!doctype html><html lang=zh><head><meta charset=utf-8>"
     "<meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>EdgeVisionRT</title>"
-    "<style>body{font-family:monospace;background:#111;color:#0f0;margin:0;padding:12px}"
-    "#bar{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}"
-    "button{background:#222;color:#0f0;border:1px solid #0f0;padding:6px 14px;cursor:pointer}"
-    "#wrap{position:relative;display:inline-block}"
-    "#view{max-width:96vw;border:1px solid #0f0}"
+    "<title>EdgeVisionRT Console</title>"
+    "<style>"
+    ":root{--bg:#0b0f14;--panel:#111823;--line:#1e2a3a;--txt:#d7e3f4;--dim:#8aa0b8;"
+    "--acc:#2fbf71;--warn:#f5a623;--bad:#ff5d5d;--info:#4aa8ff}"
+    "*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);"
+    "font:13px/1.5 -apple-system,'Segoe UI',Roboto,'Noto Sans SC',monospace}"
+    "header{display:flex;gap:10px;align-items:center;padding:10px 14px;"
+    "background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}"
+    "header b{font-size:15px}header .ver{color:var(--dim);font-size:12px}"
+    ".pill{padding:2px 10px;border-radius:20px;border:1px solid var(--line);font-size:12px}"
+    ".pill.run{color:var(--acc);border-color:var(--acc)}"
+    ".pill.idle{color:var(--dim)}.pill.stop{color:var(--warn);border-color:var(--warn)}"
+    "button{background:#16202e;color:var(--txt);border:1px solid var(--line);border-radius:6px;"
+    "padding:6px 14px;cursor:pointer}button:hover{border-color:var(--acc)}"
+    "button.danger:hover{border-color:var(--bad)}"
+    "main{display:grid;grid-template-columns:minmax(320px,1.35fr) minmax(300px,1fr);gap:12px;padding:12px}"
+    ".card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px}"
+    ".card h3{margin:0 0 8px;font-size:13px;color:var(--dim);font-weight:600}"
+    "#wrap{position:relative;display:inline-block;max-width:100%}"
+    "#view{max-width:100%;border:1px solid var(--line);border-radius:6px;display:block;background:#000}"
     "#ov{position:absolute;left:0;top:0;pointer-events:none}"
-    "#rule{background:#221;color:#fc0;border:1px solid #fc0;padding:4px 8px;margin-bottom:8px}"
-    "#worker{background:#112;color:#8cf;border:1px solid #8cf;padding:4px 8px;margin-bottom:8px}"
-    "#st{white-space:pre-wrap;font-size:12px;margin-top:8px}</style></head><body>"
-    "<div id=bar><b>EdgeVisionRT [M8a]</b>"
+    ".kv{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:12px}"
+    ".kv dt{color:var(--dim)}.kv dd{margin:0;text-align:right;font-variant-numeric:tabular-nums}"
+    ".bar{height:6px;background:#0a0e13;border-radius:4px;overflow:hidden;margin:3px 0 8px}"
+    ".bar i{display:block;height:100%;background:var(--acc)}"
+    "table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}"
+    "th,td{text-align:right;padding:3px 6px;border-bottom:1px solid var(--line)}"
+    "th:first-child,td:first-child{text-align:left}"
+    "th{color:var(--dim);font-weight:600}"
+    "#events{max-height:220px;overflow:auto;font-size:12px}"
+    "#events div{padding:3px 6px;border-left:3px solid var(--line);margin:4px 0;background:#0d131c}"
+    "#events div.start{border-color:var(--acc)}#events div.review{border-color:var(--warn)}"
+    "#events div.fault{border-color:var(--bad)}"
+    "#fault{display:none;background:#2a1214;border:1px solid var(--bad);color:#ffb3b3;"
+    "border-radius:8px;padding:8px 10px;margin:0 12px}"
+    "canvas#trend{width:100%;height:90px;background:#0a0e13;border:1px solid var(--line);border-radius:6px}"
+    "footer{color:var(--dim);font-size:11px;padding:8px 14px}"
+    "a{color:var(--info)}@media(max-width:900px){main{grid-template-columns:1fr}}"
+    "</style></head><body>"
+    "<header><b>EdgeVisionRT</b><span class=ver id=ver>console</span>"
+    "<span class='pill idle' id=state>IDLE</span>"
+    "<span style='flex:1'></span>"
     "<button onclick=\"api('/api/start')\">START</button>"
-    "<button onclick=\"api('/api/stop')\">STOP</button>"
-    "<span id=lat></span></div>"
-    "<div id=rule>rule: loading…</div>"
-    "<div id=worker>worker: idle</div>"
-    "<div id=wrap><img id=view src='/snapshot.jpg'>"
-    "<canvas id=ov></canvas></div><div id=st>loading…</div>"
+    "<button class=danger onclick=\"api('/api/stop')\">STOP</button>"
+    "<button onclick=\"tick()\">Refresh</button>"
+    "<a id=rtsp style='font-size:12px' href='#'>rtsp</a></header>"
+    "<div id=fault></div>"
+    "<main>"
+    "<section class=card><h3>Live (snapshot 480px + RTSP)</h3>"
+    "<div id=wrap><img id=view src='/snapshot.jpg' alt='live'>"
+    "<canvas id=ov></canvas></div>"
+    "<div class=kv style='margin-top:8px'><dt>frame</dt><dd id=f_frame>--</dd>"
+    "<dt>src frame / epoch</dt><dd id=f_src>--</dd>"
+    "<dt>detections</dt><dd id=f_dets>--</dd>"
+    "<dt>capture ts (mono)</dt><dd id=f_ts>--</dd></div></section>"
+    "<section class=card><h3>Pipeline latency (capped 600 samples)</h3>"
+    "<table><tr><th>stage</th><th>avg</th><th>p50</th><th>p99</th><th>n</th></tr>"
+    "<tr><td>decode</td><td id=m_dec_a>--</td><td id=m_dec_p>--</td><td id=m_dec_9>--</td><td id=m_dec_n>--</td></tr>"
+    "<tr><td>infer (gpu)</td><td id=m_inf_a>--</td><td id=m_inf_p>--</td><td id=m_inf_9>--</td><td id=m_inf_n>--</td></tr>"
+    "<tr><td>post (nms)</td><td id=m_post_a>--</td><td id=m_post_p>--</td><td id=m_post_9>--</td><td id=m_post_n>--</td></tr></table>"
+    "<h3 style='margin-top:10px'>Trend (last 120s, 1s buckets)</h3><canvas id=trend></canvas>"
+    "<div class=kv><dt>queue peak</dt><dd id=m_q>--</dd>"
+    "<dt>drops pool/queue</dt><dd id=m_drop>--</dd></div></section>"
+    "<section class=card><h3>Board / service</h3>"
+    "<div class=kv><dt>board</dt><dd id=b_board>--</dd><dt>L4T</dt><dd id=b_l4t>--</dd>"
+    "<dt>engine</dt><dd id=b_eng>--</dd><dt>input</dt><dd id=b_in>--</dd>"
+    "<dt>uptime</dt><dd id=b_up>--</dd><dt>starts/stops</dt><dd id=b_ss>--</dd></div>"
+    "<h3 style='margin-top:10px'>Resources</h3>"
+    "<div class=kv><dt>CPU</dt><dd id=r_cpu>--</dd></div><div class=bar><i id=r_cpu_b></i></div>"
+    "<div class=kv><dt>GPU</dt><dd id=r_gpu>--</dd></div><div class=bar><i id=r_gpu_b></i></div>"
+    "<div class=kv><dt>MEM</dt><dd id=r_mem>--</dd><dt>TEMP</dt><dd id=r_temp>--</dd>"
+    "<dt>session</dt><dd id=r_sess>--</dd></div></section>"
+    "<section class=card><h3>Scheduler rule + worker</h3>"
+    "<div class=kv><dt>rule model</dt><dd id=w_model>--</dd><dt>reason</dt><dd id=w_reason>--</dd>"
+    "<dt>low-conf</dt><dd id=w_low>--</dd><dt>max conf</dt><dd id=w_max>--</dd>"
+    "<dt>reviews</dt><dd id=w_rev>--</dd><dt>worker</dt><dd id=w_state>--</dd></div>"
+    "<h3 style='margin-top:10px'>Events (cap 200, newest last)</h3><div id=events></div></section>"
+    "</main>"
+    "<footer>Data: <code>/snapshot.jpg</code> + <code>/api/{status,rule,worker,dets,meta,metrics,events}</code>"
+    " | Latency clocks: decode/infer/post via steady_clock, GPU time includes enqueue+sync"
+    " | RTSP: <code id=rtsp2></code></footer>"
     "<script>"
-    "const img=document.getElementById('view'),ov=document.getElementById('ov'),"
-    "st=document.getElementById('st'),lat=document.getElementById('lat'),"
-    "rule=document.getElementById('rule'),wk=document.getElementById('worker');"
-    "function api(p){fetch(p).then(r=>r.text()).then(t=>st.textContent=t);}"
-    "function tick(){"
-    "img.src='/snapshot.jpg?t='+Date.now();"
-    "fetch('/api/dets').then(r=>r.json()).then(j=>{"
+    "const $=id=>document.getElementById(id);"
+    "const img=$('view'),ov=$('ov');"
+    "function api(p){fetch(p).then(r=>r.text()).then(()=>tick()).catch(()=>{});}"
+    "function fmt(v,d=1){return (v==null||v<0)?'--':(+v).toFixed(d);}"
+    "function drawBoxes(j){"
     "const r=img.getBoundingClientRect();ov.width=r.width;ov.height=r.height;"
     "ov.style.width=r.width+'px';ov.style.height=r.height+'px';"
     "const c=ov.getContext('2d');c.clearRect(0,0,ov.width,ov.height);"
+    "if(!img.naturalWidth)return;"
     "const kx=ov.width/img.naturalWidth,ky=ov.height/img.naturalHeight;"
-    "c.strokeStyle='#0f0';c.lineWidth=2;c.font='12px monospace';c.fillStyle='#0f0';"
-    "(j.dets||[]).forEach(d=>{c.strokeRect(d.x*kx,d.y*ky,d.w*kx,d.h*ky);"
-    "c.fillText((d.cls??'?')+':'+(+d.conf).toFixed(2),d.x*kx,(d.y*ky-4>10?d.y*ky-4:d.y*ky+14));});"
-    "lat.textContent='frame '+j.frame+' dets '+(j.dets||[]).length;});"
-    "fetch('/api/status').then(r=>r.json()).then(s=>{"
-    "st.textContent=JSON.stringify(s);}).catch(()=>{});"
-    "fetch('/api/rule').then(r=>r.json()).then(g=>{"
-    "rule.textContent='model='+g.active_model+' | '+g.reason+"
-    "' | low_conf '+g.low_conf_streak+' streak / '+g.low_conf_frames+' frames'+"
-    "' | max_conf '+(+g.last_max_conf).toFixed(2)"
-    "+' | reviews '+g.reviews_written;"
-    "rule.style.borderColor=(g.active_model==='yolo')?'#0f0':'#f80';}).catch(()=>{});"
-    "fetch('/api/worker').then(r=>r.json()).then(w=>{"
-    "wk.textContent='worker='+w.worker+' | reviews '+w.reviews;}).catch(()=>{});}"
+    "c.lineWidth=2;c.font='12px monospace';"
+    "(j.dets||[]).forEach(d=>{c.strokeStyle=d.conf>=0.5?'#2fbf71':'#f5a623';"
+    "c.strokeRect(d.x*kx,d.y*ky,d.w*kx,d.h*ky);c.fillStyle=c.strokeStyle;"
+    "c.fillText((d.cls??'?')+':'+(+d.conf).toFixed(2),d.x*kx,(d.y*ky-4>10?d.y*ky-4:d.y*ky+14));});}"
+    "function drawTrend(tr){const cv=$('trend'),c=cv.getContext('2d');"
+    "cv.width=cv.clientWidth||600;cv.height=90;c.clearRect(0,0,cv.width,cv.height);"
+    "if(!tr||!tr.length)return;const W=cv.width,H=cv.height;"
+    "let mx=1;tr.forEach(t=>{mx=Math.max(mx,t.infer||0)});"
+    "c.strokeStyle='#2fbf71';c.beginPath();"
+    "tr.forEach((t,i)=>{const x=i/(tr.length-1||1)*W,y=H-4-(t.infer/mx)*(H-10);"
+    "i?c.lineTo(x,y):c.moveTo(x,y)});c.stroke();"
+    "c.fillStyle='#8aa0b8';c.fillText('infer p50 ms (max '+mx.toFixed(1)+')',6,12);}"
+    "async function tick(){"
+    "img.src='/snapshot.jpg?t='+Date.now();"
+    "try{const j=await(await fetch('/api/dets')).json();drawBoxes(j);"
+    "$('f_frame').textContent=j.frame;$('f_src').textContent=j.src_id+' / epoch '+j.epoch;"
+    "$('f_dets').textContent=(j.dets||[]).length;"
+    "$('f_ts').textContent=(j.ts_mono_ns/1e9).toFixed(2)+'s';}catch(e){}"
+    "try{const s=await(await fetch('/api/status')).json();"
+    "const st=$('state');st.textContent=s.state;"
+    "st.className='pill '+(s.state==='RUNNING'?'run':s.state==='IDLE'?'idle':'stop');"
+    "$('r_sess').textContent=s.session||'-';"
+    "$('w_low').textContent=s.low_conf_streak+' streak / '+s.low_conf_frames+' frames';"
+    "$('w_max').textContent=fmt(s.last_max_conf,2);$('w_rev').textContent=s.reviews_written;"
+    "$('r_cpu').textContent=fmt(s.cpu_pct)+'%';$('r_cpu_b').style.width=Math.max(0,s.cpu_pct)+'%';"
+    "$('r_gpu').textContent=fmt(s.gpu_pct)+'%';$('r_gpu_b').style.width=Math.max(0,s.gpu_pct)+'%';"
+    "$('r_mem').textContent=(s.mem_avail_mb<0?'--':(s.mem_total_mb-s.mem_avail_mb)+'/'+s.mem_total_mb+' MB');"
+    "$('r_temp').textContent=fmt(s.temp_c)+' C';"
+    "$('b_ss').textContent=s.start_count+' / '+s.stop_count;"
+    "$('b_up').textContent=s.uptime_s+'s';"
+    "const f=$('fault');if(s.last_fault){f.style.display='block';f.textContent='FAULT: '+s.last_fault;}"
+    "else f.style.display='none';}catch(e){}"
+    "try{const g=await(await fetch('/api/rule')).json();"
+    "$('w_model').textContent=g.active_model;$('w_reason').textContent=g.reason;}catch(e){}"
+    "try{const w=await(await fetch('/api/worker')).json();"
+    "$('w_state').textContent=w.worker;}catch(e){}"
+    "try{const m=await(await fetch('/api/meta')).json();"
+    "$('ver').textContent=m.version;$('b_board').textContent=m.board_model||'--';"
+    "$('b_l4t').textContent=(m.l4t||'--').slice(0,40);$('b_eng').textContent=m.engine;"
+    "$('b_in').textContent=m.input_wh;$('rtsp2').textContent='rtsp://<board-ip>:'+m.rtsp_port+'/live';"
+    "$('rtsp').href='#';}catch(e){}"
+    "try{const k=await(await fetch('/api/metrics')).json();"
+    "$('m_dec_a').textContent=fmt(k.decode.avg,2);$('m_dec_p').textContent=fmt(k.decode.p50,2);"
+    "$('m_dec_9').textContent=fmt(k.decode.p99,2);$('m_dec_n').textContent=k.decode.n;"
+    "$('m_inf_a').textContent=fmt(k.infer.avg,2);$('m_inf_p').textContent=fmt(k.infer.p50,2);"
+    "$('m_inf_9').textContent=fmt(k.infer.p99,2);$('m_inf_n').textContent=k.infer.n;"
+    "$('m_post_a').textContent=fmt(k.post.avg,2);$('m_post_p').textContent=fmt(k.post.p50,2);"
+    "$('m_post_9').textContent=fmt(k.post.p99,2);$('m_post_n').textContent=k.post.n;"
+    "$('m_q').textContent=k.queue_peak;$('m_drop').textContent=k.pool_drop+' / '+k.queue_drop;"
+    "drawTrend(k.trend);}catch(e){}"
+    "try{const v=await(await fetch('/api/events')).json();const box=$('events');box.innerHTML='';"
+    "(v.events||[]).slice(-40).forEach(e=>{const d=document.createElement('div');"
+    "d.className=e.type||'';d.textContent=new Date(e.t*1000).toLocaleTimeString()+' ['+e.type+'] '+e.detail;"
+    "box.appendChild(d);});box.scrollTop=box.scrollHeight;}catch(e){}"
+    "}"
     "setInterval(tick,1000);tick();</script></body></html>";
 
 int main(int argc, char** argv) {
